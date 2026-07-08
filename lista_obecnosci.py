@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Attendance Sheet App (Lista Obecności)
-Single-page DOCX output, per-row signatures, L4, delegacja, uwaga for inne.
+Attendance Sheet App (Lista Obecnosci)
+PySide6 GUI — HTML export with embedded signature, prints to one A4 page.
 """
 
 import sys
 import os
-import tempfile
+import base64
+import io
 from datetime import date, timedelta
 from calendar import monthrange
 
@@ -17,21 +18,14 @@ from PySide6.QtWidgets import (
     QFrame, QSizePolicy
 )
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QPainter, QPen, QColor, QFont, QImage, QPainterPath
-
-from docx import Document
-from docx.shared import Pt, Cm, Mm
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.table import WD_TABLE_ALIGNMENT
-from docx.oxml.ns import nsdecls, qn
-from docx.oxml import parse_xml
+from PySide6.QtGui import QPainter, QPen, QColor, QFont, QImage, QPainterPath, QPixmap
 
 
 # ─────────────────────────────────────────────
 # Polish holidays
 # ─────────────────────────────────────────────
 
-def _easter(year: int) -> date:
+def _easter(year):
     a = year % 19; b = year // 100; c = year % 100
     d = b // 4; e = b % 4; f = (b + 8) // 25
     g = (b - f + 1) // 3; h = (19 * a + b - d - g + 15) % 30
@@ -42,27 +36,26 @@ def _easter(year: int) -> date:
     return date(year, month, day)
 
 
-def polish_holidays(year: int) -> set:
+def polish_holidays(year):
     e = _easter(year)
     fixed = {date(year, 1, 1), date(year, 1, 6), date(year, 5, 1),
              date(year, 5, 3), date(year, 8, 15), date(year, 11, 1),
              date(year, 11, 11), date(year, 12, 25), date(year, 12, 26)}
-    mov = {e, e + timedelta(days=1), e + timedelta(days=49), e + timedelta(days=60)}
-    return fixed | mov
+    return fixed | {e, e + timedelta(days=1), e + timedelta(days=49), e + timedelta(days=60)}
 
 
-def holiday_name(d: date) -> str:
-    h = {(1, 1): "Nowy Rok", (6, 1): "Święto Trzech Króli", (1, 5): "Święto Pracy",
-         (3, 5): "Święto Konstytucji 3 Maja", (15, 8): "Wniebowzięcie NMP",
-         (1, 11): "Wszystkich Świętych", (11, 11): "Narodowe Święto Niepodległości",
-         (25, 12): "Boże Narodzenie", (26, 12): "Boże Narodzenie (drugi dzień)"}
+def holiday_name(d):
+    h = {(1, 1): "Nowy Rok", (6, 1): "Swieto Trzech Kroli", (1, 5): "Swieto Pracy",
+         (3, 5): "Swieto Konstytucji 3 Maja", (15, 8): "Wniebowziecie NMP",
+         (1, 11): "Wszystkich Swietych", (11, 11): "Narodowe Swieto Niepodleglosci",
+         (25, 12): "Boze Narodzenie", (26, 12): "Boze Narodzenie (drugi dzien)"}
     key = (d.day, d.month)
     if key in h: return h[key]
     e = _easter(d.year)
     if d == e: return "Wielkanoc"
-    if d == e + timedelta(days=1): return "Poniedziałek Wielkanocny"
-    if d == e + timedelta(days=49): return "Zielone Świątki"
-    if d == e + timedelta(days=60): return "Boże Ciało"
+    if d == e + timedelta(days=1): return "Poniedzialek Wielkanocny"
+    if d == e + timedelta(days=49): return "Zielone Swiatki"
+    if d == e + timedelta(days=60): return "Boze Cialo"
     return ""
 
 
@@ -72,13 +65,12 @@ STATUS_OPTIONS = [
     ("home_office", "Home Office"),
     ("urlop", "Urlop"),
     ("l4", "L4"),
-    ("wolne_swieto", "Wolne za święto"),
+    ("wolne_swieto", "Wolne za swieto"),
     ("delegacja", "Delegacja"),
     ("nieobecny", "Nieobecny"),
     ("inne", "Inne"),
 ]
 
-# More saturated backgrounds for better contrast
 WEEKEND_COLOR = QColor(180, 200, 235)
 HOLIDAY_COLOR = QColor(255, 195, 160)
 
@@ -100,17 +92,15 @@ class SignatureCanvas(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.fillRect(self.rect(), Qt.GlobalColor.white)
-        pen = QPen(QColor(180, 180, 180), 1, Qt.PenStyle.DashLine)
-        p.setPen(pen)
+        p.setPen(QPen(QColor(180, 180, 180), 1, Qt.PenStyle.DashLine))
         y = self.height() - 25
         p.drawLine(10, y, self.width() - 10, y)
         p.setPen(QColor(120, 120, 120))
         p.setFont(QFont("Arial", 9))
         p.drawText(12, y - 4, "Podpis:")
         if not self._path.isEmpty():
-            pen2 = QPen(QColor(0, 0, 140), 2, Qt.PenStyle.SolidLine,
-                        Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
-            p.setPen(pen2)
+            p.setPen(QPen(QColor(0, 0, 140), 2, Qt.PenStyle.SolidLine,
+                         Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
             p.drawPath(self._path)
 
     def mousePressEvent(self, event):
@@ -130,30 +120,31 @@ class SignatureCanvas(QWidget):
         self._stroked = False
         self.update()
 
-    def has_sig(self) -> bool:
+    def has_sig(self):
         return self._stroked and not self._path.isEmpty()
 
-    def save_png(self, path: str) -> bool:
-        """Grab widget pixels and crop to signature area — guaranteed WYSIWYG."""
+    def to_data_url(self):
+        """Return signature as a base64 data URL — no temp files, no cropping issues."""
         if not self.has_sig():
-            return False
-        pixmap = self.grab()
-        if pixmap.isNull():
-            return False
-        # Crop above guide line (signature drawing area)
-        # Guide line is at height - 25; crop 5px above "Podpis:" text
-        crop_h = self.height() - 35
-        if crop_h < 10:
-            crop_h = self.height() - 10
-        cropped = pixmap.copy(0, 0, pixmap.width(), crop_h)
-        if cropped.isNull():
-            return False
-        # Scale up for document quality
-        scaled = cropped.scaled(
-            cropped.width() * 3, cropped.height() * 3,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation)
-        return scaled.save(path, "PNG")
+            return None
+        # Grab what's on screen — guaranteed WYSIWYG
+        px = self.grab()
+        if px.isNull():
+            return None
+        # Crop above guide line
+        ch = self.height() - 35
+        if ch < 10: ch = self.height() - 10
+        c = px.copy(0, 0, px.width(), ch)
+        if c.isNull():
+            return None
+        # Scale up 3x
+        s = c.scaled(c.width() * 3, c.height() * 3,
+                     Qt.AspectRatioMode.KeepAspectRatio,
+                     Qt.TransformationMode.SmoothTransformation)
+        buf = io.BytesIO()
+        s.save(buf, "PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        return f"data:image/png;base64,{b64}"
 
 
 # ─────────────────────────────────────────────
@@ -161,7 +152,7 @@ class SignatureCanvas(QWidget):
 # ─────────────────────────────────────────────
 
 class DayRow(QFrame):
-    def __init__(self, day_date: date, is_holiday: bool, holiday_name_str: str = "", parent=None):
+    def __init__(self, day_date, is_holiday, holiday_name_str="", parent=None):
         super().__init__(parent)
         self.day_date = day_date
         self._is_weekend = day_date.weekday() >= 5
@@ -210,8 +201,7 @@ class DayRow(QFrame):
             self.uwaga_edit.setPlaceholderText("Opis")
         else:
             self.uwaga_edit.setEnabled(False)
-            if not (val == "obecny" and self.uwaga_edit.text() == "Tychy"):
-                self.uwaga_edit.setText("")
+            self.uwaga_edit.setText("")
 
     def _apply_holiday(self):
         for i in range(self.status_combo.count()):
@@ -234,10 +224,10 @@ class DayRow(QFrame):
         self.uwaga_edit.setText("")
         self.setStyleSheet("")
 
-    def is_workday(self) -> bool:
+    def is_workday(self):
         return not self._is_weekend and not self._is_holiday
 
-    def get_data(self) -> dict:
+    def get_data(self):
         return {
             "date": self.day_date,
             "status": self.status_combo.currentData(),
@@ -256,7 +246,7 @@ class DayRow(QFrame):
 class AttendanceApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Lista Obecności")
+        self.setWindowTitle("Lista Obecnosci")
         self.setMinimumSize(700, 700)
         self._rows = []
         self._setup_ui()
@@ -267,41 +257,38 @@ class AttendanceApp(QMainWindow):
         ml = QVBoxLayout(c)
         ml.setSpacing(8)
 
-        # Top bar
         top = QHBoxLayout()
         self.month_spin = QSpinBox()
         self.month_spin.setRange(1, 12)
         self.month_spin.setValue(date.today().month)
-        self.month_spin.setPrefix("Miesiąc: ")
+        self.month_spin.setPrefix("Miesiac: ")
         self.month_spin.setMinimumWidth(140)
         self.year_spin = QSpinBox()
         self.year_spin.setRange(2020, 2100)
         self.year_spin.setValue(date.today().year)
         self.year_spin.setPrefix("Rok: ")
         self.year_spin.setMinimumWidth(120)
-        self.refresh_btn = QPushButton("Odśwież")
+        self.refresh_btn = QPushButton("Odswiez")
         self.refresh_btn.clicked.connect(self._rebuild)
         top.addWidget(self.month_spin)
         top.addWidget(self.year_spin)
         top.addWidget(self.refresh_btn)
         top.addStretch()
-        top.addWidget(QLabel("Imię i nazwisko:"))
+        top.addWidget(QLabel("Imie i nazwisko:"))
         self.name_edit = QLineEdit("Dawid Bogocz")
         self.name_edit.setMinimumWidth(140)
         top.addWidget(self.name_edit)
-        top.addWidget(QLabel("Dział:"))
-        self.dept_edit = QLineEdit("Dział IT")
+        top.addWidget(QLabel("Dzial:"))
+        self.dept_edit = QLineEdit("Dzial IT")
         self.dept_edit.setMinimumWidth(120)
         top.addWidget(self.dept_edit)
         ml.addLayout(top)
 
-        # Separator
         s = QFrame()
         s.setFrameShape(QFrame.Shape.HLine)
         s.setFrameShadow(QFrame.Shadow.Sunken)
         ml.addWidget(s)
 
-        # Header row — widths match DayRow widgets exactly
         hdr = QHBoxLayout()
         hdr.setSpacing(6)
         hdr.setContentsMargins(0, 0, 0, 0)
@@ -313,7 +300,6 @@ class AttendanceApp(QMainWindow):
         hdr.addStretch()
         ml.addLayout(hdr)
 
-        # Scroll area
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -325,17 +311,15 @@ class AttendanceApp(QMainWindow):
         self.scroll.setWidget(self.tw)
         ml.addWidget(self.scroll, stretch=1)
 
-        # Signature
         sl = QHBoxLayout()
         sl.addWidget(QLabel("Podpis:"))
         self.sig = SignatureCanvas()
         sl.addWidget(self.sig, stretch=1)
-        cb = QPushButton("Wyczyść")
+        cb = QPushButton("Wyczysc")
         cb.clicked.connect(self.sig.clear)
         sl.addWidget(cb)
         ml.addLayout(sl)
 
-        # Buttons
         bl = QHBoxLayout()
         af = QPushButton("Auto-fill workdays")
         af.setMinimumHeight(36)
@@ -343,7 +327,7 @@ class AttendanceApp(QMainWindow):
         af.clicked.connect(self._auto_fill)
         bl.addWidget(af)
         bl.addStretch()
-        ex = QPushButton("Zapisz DOCX")
+        ex = QPushButton("Zapisz HTML")
         ex.setMinimumHeight(36)
         ex.setStyleSheet("font-size: 14px; font-weight: bold; padding: 6px 20px;")
         ex.clicked.connect(self._export)
@@ -373,10 +357,35 @@ class AttendanceApp(QMainWindow):
             if r.is_workday():
                 r.set_present()
                 n += 1
-        QMessageBox.information(self, "Auto-fill", f"Wypełniono {n} dni: Obecny")
+        QMessageBox.information(self, "Auto-fill", f"Wypelniono {n} dni: Obecny")
 
-    def _collect(self) -> list:
+    def _collect(self):
         return [r.get_data() for r in self._rows]
+
+    def _cell_text(self, rd):
+        """Return (wejscie_text, wyjscie_text, show_sig, sig_label) for a row."""
+        st = rd["status"]
+        sl = rd["status_label"]
+        if st in ("obecny", "home_office", "delegacja"):
+            wej = ""; wyj = ""
+            label = ""
+            if st == "home_office": label = "Home Office"
+            elif st == "delegacja":
+                loc = rd.get("uwaga", "")
+                label = f"Delegacja - {loc}" if loc else "Delegacja"
+            return (wej, wyj, True, label)
+        else:
+            if rd["is_holiday"] and st == "wolne_swieto":
+                hn = rd.get("holiday_name", "")
+                t = f"Wolne: {hn}" if hn else "Wolne za swieto"
+            elif rd["is_weekend"] and not st:
+                t = "dzien wolny od pracy"
+            elif st == "inne":
+                uw = rd.get("uwaga", "")
+                t = f"Inne - {uw}" if uw else "Inne"
+            else:
+                t = sl if sl else "—"
+            return (t, t, False, "")
 
     def _export(self):
         month = self.month_spin.value()
@@ -385,175 +394,93 @@ class AttendanceApp(QMainWindow):
         dept = self.dept_edit.text().strip() or ""
 
         fp, _ = QFileDialog.getSaveFileName(
-            self, "Zapisz DOCX",
-            os.path.expanduser(f"~/lista_obecnosci_{month:02d}-{year}.docx"),
-            "Word (*.docx)")
+            self, "Zapisz HTML",
+            os.path.expanduser(f"~/lista_obecnosci_{month:02d}-{year}.html"),
+            "HTML (*.html *.htm)")
         if not fp:
             return
 
         data = self._collect()
-        sig_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
-        has_sig = self.sig.save_png(sig_path)
+        sig_url = self.sig.to_data_url()
 
         try:
-            self._build_docx(fp, data, name, dept, month, year,
-                             sig_path if has_sig else None)
-            QMessageBox.information(self, "Sukces", f"DOKUMENT ZAPISANY:\n{fp}")
+            html = self._build_html(data, name, dept, month, year, sig_url)
+            with open(fp, "w", encoding="utf-8") as f:
+                f.write(html)
+            QMessageBox.information(self, "Sukces", f"HTML ZAPISANY:\n{fp}")
         except Exception as e:
-            QMessageBox.critical(self, "Błąd", f"Nie udało się zapisać DOCX:\n{e}")
+            QMessageBox.critical(self, "Blad", f"Nie udalo sie zapisac HTML:\n{e}")
 
-    def _build_docx(self, fp, data, name, dept, month, year, sig_path=None):
-        doc = Document()
+    def _build_html(self, data, name, dept, month, year, sig_url):
+        mn = ["", "Styczen", "Luty", "Marzec", "Kwiecien", "Maj",
+              "Czerwiec", "Lipiec", "Sierpien", "Wrzesien",
+              "Pazdziernik", "Listopad", "Grudzien"]
 
-        # Tight margins for single-page fit
-        for section in doc.sections:
-            section.top_margin = Cm(0.7)
-            section.bottom_margin = Cm(0.5)
-            section.left_margin = Cm(1.2)
-            section.right_margin = Cm(1.0)
+        rows_html = ""
+        row_n = 1
+        for rd in data:
+            bg = ""
+            if rd["is_holiday"]:
+                bg = ' style="background:#FCE4D6"'
+            elif rd["is_weekend"] and not rd["status"]:
+                bg = ' style="background:#B0C4DE"'
 
-        doc.styles['Normal'].font.name = 'Calibri'
-        doc.styles['Normal'].font.size = Pt(10)
+            wej, wyj, show_sig, sig_label = self._cell_text(rd)
+            date_str = rd["date"].strftime("%d-%m-%Y")
 
-        # Title — compact
-        p = doc.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p.paragraph_format.space_after = Pt(0)
-        p.paragraph_format.space_before = Pt(0)
-        p.paragraph_format.line_spacing = Pt(12)
-        r = p.add_run(f"LISTA OBECNOŚCI - {month:02d}-{year}")
-        r.bold = True
-        r.font.size = Pt(12)
-        r.font.name = 'Calibri'
+            # Determine cell content for Wejscie and Wyjscie
+            def make_cell(text, has_sig, label):
+                parts = []
+                if label:
+                    parts.append(f'<div style="font-size:10pt">{label}</div>')
+                if has_sig and sig_url:
+                    parts.append(f'<img src="{sig_url}" style="height:0.7cm; display:block; margin:0 auto">')
+                elif not label and text:
+                    parts.append(f'<span style="font-size:10pt">{text}</span>')
+                return "".join(parts) if parts else "&nbsp;"
 
-        # Employee info
-        p = doc.add_paragraph()
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p.paragraph_format.space_after = Pt(0)
-        p.paragraph_format.space_before = Pt(0)
-        p.paragraph_format.line_spacing = Pt(12)
-        r = p.add_run(name + (f" - {dept}" if dept else ""))
-        r.font.size = Pt(10)
-        r.font.name = 'Calibri'
+            wj = make_cell(wej, show_sig, sig_label)
+            wy = make_cell(wyj, show_sig, sig_label)
 
-        # 3 columns: Data | Wejście | Wyjście
-        headers = ["Data", "Wejście", "Wyjście"]
-        nrows = len(data) + 1
-        table = doc.add_table(rows=nrows, cols=3)
-        table.alignment = WD_TABLE_ALIGNMENT.CENTER
-        table.style = 'Table Grid'
+            rows_html += f"""        <tr{bg}>
+            <td style="text-align:center;font-size:10pt;padding:2px 4px">{date_str}</td>
+            <td style="text-align:center;font-size:10pt;padding:2px 4px">{wj}</td>
+            <td style="text-align:center;font-size:10pt;padding:2px 4px">{wy}</td>
+        </tr>
+"""
+            row_n += 1
 
-        # Reduce cell padding
-        tbl_pr = table._tbl.tblPr
-        tbl_pr.append(parse_xml(
-            f'<w:tblLayout {nsdecls("w")} w:type="fixed"/>'))
+        info = name + (f" - {dept}" if dept else "")
 
-        for ci, h in enumerate(headers):
-            cell = table.rows[0].cells[ci]
-            cell.text = ""
-            cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
-            cell.paragraphs[0].paragraph_format.space_after = Pt(0)
-            cell.paragraphs[0].paragraph_format.space_before = Pt(0)
-            # Set cell margins to 0
-            tc_pr = cell._tc.get_or_add_tcPr()
-            tc_mar = parse_xml(
-                f'<w:tcMar {nsdecls("w")}>'
-                f'<w:top w:w="0" w:type="dxa"/>'
-                f'<w:left w:w="0" w:type="dxa"/>'
-                f'<w:bottom w:w="0" w:type="dxa"/>'
-                f'<w:right w:w="0" w:type="dxa"/>'
-                f'</w:tcMar>')
-            tc_pr.append(tc_mar)
-            r = cell.paragraphs[0].add_run(h)
-            r.bold = True; r.font.size = Pt(10); r.font.name = 'Calibri'
-            self._shade(cell, "D9D9D9")
-
-        # Use atLeast row height so rows match content
-
-        for ri, rd in enumerate(data):
-            d = rd["date"]
-            st = rd["status"]
-
-            # Determine cell content
-            if st in ("obecny", "home_office", "delegacja"):
-                if st == "obecny":
-                    wej = ""
-                    wyj = ""
-                elif st == "home_office":
-                    wej = "Home Office"
-                    wyj = "Home Office"
-                else:
-                    loc = rd.get("uwaga", "")
-                    txt = f"Delegacja - {loc}" if loc else "Delegacja"
-                    wej = txt; wyj = txt
-            elif st in ("urlop", "l4", "wolne_swieto", "nieobecny", "inne", ""):
-                if rd["is_holiday"] and st == "wolne_swieto":
-                    hn = rd.get("holiday_name", "")
-                    wej = f"Wolne: {hn}" if hn else "Wolne za święto"
-                elif rd["is_weekend"] and not st:
-                    wej = "dzień wolny od pracy"
-                elif st == "inne":
-                    uw = rd.get("uwaga", "")
-                    wej = f"Inne - {uw}" if uw else "Inne"
-                else:
-                    wej = rd["status_label"] if rd["status_label"] else "—"
-                wyj = wej
-            else:
-                wej = rd["status_label"]; wyj = wej
-
-            show_sig = sig_path and os.path.exists(sig_path) and st in ("obecny", "home_office", "delegacja")
-
-            doc_row = table.rows[ri + 1]
-            cells_data = [d.strftime("%d-%m-%Y"), wej, wyj]
-
-            for ci in range(3):
-                cell = doc_row.cells[ci]
-                cell.text = ""
-                # Set cell margins to 0
-                tc_pr = cell._tc.get_or_add_tcPr()
-                tc_mar = parse_xml(
-                    f'<w:tcMar {nsdecls("w")}>'
-                    f'<w:top w:w="0" w:type="dxa"/>'
-                    f'<w:left w:w="0" w:type="dxa"/>'
-                    f'<w:bottom w:w="0" w:type="dxa"/>'
-                    f'<w:right w:w="0" w:type="dxa"/>'
-                    f'</w:tcMar>')
-                tc_pr.append(tc_mar)
-                par = cell.paragraphs[0]
-                par.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                par.paragraph_format.space_after = Pt(0)
-                par.paragraph_format.space_before = Pt(0)
-                par.paragraph_format.line_spacing = Pt(12)
-
-                if ci >= 1 and show_sig:
-                    # Signature in Wejście/Wyjście
-                    if st == "home_office":
-                        r = par.add_run("Home Office\n")
-                        r.font.size = Pt(8); r.font.name = 'Calibri'
-                    elif st == "delegacja":
-                        loc = rd.get("uwaga", "")
-                        label = f"Delegacja - {loc}\n" if loc else "Delegacja\n"
-                        r = par.add_run(label)
-                        r.font.size = Pt(8); r.font.name = 'Calibri'
-                    r = par.add_run()
-                    r.add_picture(sig_path, width=Cm(2.0), height=Cm(0.5))
-                else:
-                    txt = str(cells_data[ci])
-                    if txt:
-                        r = par.add_run(txt)
-                        r.font.size = Pt(10); r.font.name = 'Calibri'
-
-                # Background colors
-                if rd["is_holiday"]:
-                    self._shade(cell, "FCE4D6")
-                elif rd["is_weekend"] and not rd["status"]:
-                    self._shade(cell, "B0C4DE")
-
-        doc.save(fp)
-
-    def _shade(self, cell, color):
-        cell._tc.get_or_add_tcPr().append(
-            parse_xml(f'<w:shd {nsdecls("w")} w:fill="{color}"/>'))
+        return f"""<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<style>
+    @page {{ size: A4; margin: 0.7cm 1cm 0.5cm 1cm; }}
+    @media print {{ body {{ margin: 0; padding: 0; }} }}
+    body {{ font-family: Calibri, Arial, sans-serif; font-size: 10pt; margin: 0.5cm; }}
+    h1 {{ text-align: center; font-size: 14pt; margin: 0 0 2px 0; }}
+    .info {{ text-align: center; font-size: 10pt; margin: 0 0 4px 0; }}
+    table {{ width: 100%; border-collapse: collapse; }}
+    th, td {{ border: 1px solid #888; padding: 2px 4px; }}
+    th {{ background: #D9D9D9; font-size: 10pt; text-align: center; }}
+    td {{ vertical-align: middle; }}
+    tr:nth-child(even) td {{ background: inherit; }}
+</style>
+</head>
+<body>
+<h1>LISTA OBECNOSCI - {month:02d}-{year}</h1>
+<div class="info">{info}</div>
+<table>
+    <tr>
+        <th style="width:18%">Data</th>
+        <th style="width:41%">Wejscie</th>
+        <th style="width:41%">Wyjscie</th>
+    </tr>
+{rows_html}</table>
+</body>
+</html>"""
 
 
 # ─────────────────────────────────────────────
