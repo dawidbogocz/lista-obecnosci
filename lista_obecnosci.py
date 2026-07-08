@@ -134,35 +134,26 @@ class SignatureCanvas(QWidget):
         return self._stroked and not self._path.isEmpty()
 
     def save_png(self, path: str) -> bool:
-        """Render signature path onto white image with generous padding."""
+        """Grab widget pixels and crop to signature area — guaranteed WYSIWYG."""
         if not self.has_sig():
             return False
-        pr = self._path.boundingRect()
-        if pr.isEmpty():
+        pixmap = self.grab()
+        if pixmap.isNull():
             return False
-        # Generous padding to prevent pen-width clipping
-        margin = 30
-        px = int(pr.x()) - margin
-        py = int(pr.y()) - margin
-        pw = int(pr.width()) + margin * 2
-        ph = int(pr.height()) + margin * 2
-        pw = max(pw, 100)
-        ph = max(ph, 50)
-        scale = 4
-        iw = pw * scale
-        ih = ph * scale
-        img = QImage(iw, ih, QImage.Format.Format_RGB32)
-        img.fill(Qt.GlobalColor.white)
-        p = QPainter(img)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.scale(scale, scale)
-        p.translate(-px, -py)
-        pen = QPen(QColor(0, 0, 140), 3, Qt.PenStyle.SolidLine,
-                   Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
-        p.setPen(pen)
-        p.drawPath(self._path)
-        p.end()
-        return img.save(path, "PNG")
+        # Crop above guide line (signature drawing area)
+        # Guide line is at height - 25; crop 5px above "Podpis:" text
+        crop_h = self.height() - 35
+        if crop_h < 10:
+            crop_h = self.height() - 10
+        cropped = pixmap.copy(0, 0, pixmap.width(), crop_h)
+        if cropped.isNull():
+            return False
+        # Scale up for document quality
+        scaled = cropped.scaled(
+            cropped.width() * 3, cropped.height() * 3,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation)
+        return scaled.save(path, "PNG")
 
 
 # ─────────────────────────────────────────────
@@ -416,31 +407,33 @@ class AttendanceApp(QMainWindow):
 
         # Tight margins for single-page fit
         for section in doc.sections:
-            section.top_margin = Cm(0.8)
-            section.bottom_margin = Cm(0.6)
+            section.top_margin = Cm(0.7)
+            section.bottom_margin = Cm(0.5)
             section.left_margin = Cm(1.2)
             section.right_margin = Cm(1.0)
 
         doc.styles['Normal'].font.name = 'Calibri'
-        doc.styles['Normal'].font.size = Pt(7)
+        doc.styles['Normal'].font.size = Pt(10)
 
-        # Title
+        # Title — compact
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.paragraph_format.space_after = Pt(0)
         p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.line_spacing = Pt(12)
         r = p.add_run(f"LISTA OBECNOŚCI - {month:02d}-{year}")
         r.bold = True
-        r.font.size = Pt(11)
+        r.font.size = Pt(12)
         r.font.name = 'Calibri'
 
         # Employee info
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p.paragraph_format.space_after = Pt(1)
+        p.paragraph_format.space_after = Pt(0)
         p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.line_spacing = Pt(12)
         r = p.add_run(name + (f" - {dept}" if dept else ""))
-        r.font.size = Pt(8)
+        r.font.size = Pt(10)
         r.font.name = 'Calibri'
 
         # 3 columns: Data | Wejście | Wyjście
@@ -472,11 +465,10 @@ class AttendanceApp(QMainWindow):
                 f'</w:tcMar>')
             tc_pr.append(tc_mar)
             r = cell.paragraphs[0].add_run(h)
-            r.bold = True; r.font.size = Pt(7); r.font.name = 'Calibri'
+            r.bold = True; r.font.size = Pt(10); r.font.name = 'Calibri'
             self._shade(cell, "D9D9D9")
 
-        # Set fixed row heights for compact layout
-        row_height = Cm(0.75)
+        # Use atLeast row height so rows match content
 
         for ri, rd in enumerate(data):
             d = rd["date"]
@@ -531,25 +523,25 @@ class AttendanceApp(QMainWindow):
                 par.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 par.paragraph_format.space_after = Pt(0)
                 par.paragraph_format.space_before = Pt(0)
-                par.paragraph_format.line_spacing = Pt(10)
+                par.paragraph_format.line_spacing = Pt(12)
 
                 if ci >= 1 and show_sig:
                     # Signature in Wejście/Wyjście
                     if st == "home_office":
                         r = par.add_run("Home Office\n")
-                        r.font.size = Pt(6.5); r.font.name = 'Calibri'
+                        r.font.size = Pt(8); r.font.name = 'Calibri'
                     elif st == "delegacja":
                         loc = rd.get("uwaga", "")
                         label = f"Delegacja - {loc}\n" if loc else "Delegacja\n"
                         r = par.add_run(label)
-                        r.font.size = Pt(6.5); r.font.name = 'Calibri'
+                        r.font.size = Pt(8); r.font.name = 'Calibri'
                     r = par.add_run()
-                    r.add_picture(sig_path, width=Cm(2.8), height=Cm(0.8))
+                    r.add_picture(sig_path, width=Cm(2.0), height=Cm(0.5))
                 else:
                     txt = str(cells_data[ci])
                     if txt:
                         r = par.add_run(txt)
-                        r.font.size = Pt(6.5); r.font.name = 'Calibri'
+                        r.font.size = Pt(10); r.font.name = 'Calibri'
 
                 # Background colors
                 if rd["is_holiday"]:
