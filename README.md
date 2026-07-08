@@ -2,8 +2,6 @@
 
 Monthly attendance sheet app with signature canvas and export to HTML, DOCX, and direct print.
 
-![Screenshot](screenshot.png)
-
 ## Features
 
 - **Month/year picker** with `< >` navigation buttons
