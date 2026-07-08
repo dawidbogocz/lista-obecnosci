@@ -159,8 +159,7 @@ class SignatureCanvas(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self._path = QPainterPath()
-            self._points = [(event.position().x(), event.position().y())]
+            self._points.append((event.position().x(), event.position().y()))
             self._path.moveTo(event.position())
             self.update()
 
@@ -216,24 +215,7 @@ class SignatureCanvas(QWidget):
         return final.save(filepath, "PNG")
 
 
-# ─────────────────────────────────────────────
-# Time input widget (no segment-replacement issue)
-# ─────────────────────────────────────────────
-
-class TimeInput(QLineEdit):
-    """QLineEdit with input mask for time entry — type naturally, no segment replacement."""
-
-    def __init__(self, default_time="08:00", parent=None):
-        super().__init__(parent)
-        self.setInputMask("00:00")
-        self.setText(default_time)
-        self.setPlaceholderText("HH:MM")
-        self.setMinimumWidth(70)
-        self.setMaxLength(5)
-
-    def get_time_str(self) -> str:
-        """Return the time as HH:MM string."""
-        return self.text().strip()
+# (Time fields use QTimeEdit)
 
 
 # ─────────────────────────────────────────────
@@ -275,8 +257,12 @@ class DayRow(QFrame):
         self.status_combo.currentIndexChanged.connect(self._on_status_changed)
         layout.addWidget(self.status_combo)
 
-        # Entry time — natural typing, no segment replacement
-        self.time_in = TimeInput("08:00")
+        # Entry time — QTimeEdit
+        self.time_in = QTimeEdit()
+        self.time_in.setDisplayFormat("HH:mm")
+        self.time_in.setTime(self.time_in.time().fromString("08:00", "HH:mm"))
+        self.time_in.setMinimumWidth(70)
+        self.time_in.setEnabled(True)
         layout.addWidget(self.time_in)
 
         # Separator
@@ -285,8 +271,12 @@ class DayRow(QFrame):
         sep.setMaximumWidth(20)
         layout.addWidget(sep)
 
-        # Exit time
-        self.time_out = TimeInput("16:00")
+        # Exit time — QTimeEdit
+        self.time_out = QTimeEdit()
+        self.time_out.setDisplayFormat("HH:mm")
+        self.time_out.setTime(self.time_out.time().fromString("16:00", "HH:mm"))
+        self.time_out.setMinimumWidth(70)
+        self.time_out.setEnabled(True)
         layout.addWidget(self.time_out)
 
         # Location
@@ -334,9 +324,9 @@ class DayRow(QFrame):
             if self.status_combo.itemData(i) == "obecny":
                 self.status_combo.setCurrentIndex(i)
                 break
-        self.time_in.setText("08:00")
+        self.time_in.setTime(self.time_in.time().fromString("08:00", "HH:mm"))
         self.time_in.setEnabled(True)
-        self.time_out.setText("16:00")
+        self.time_out.setTime(self.time_out.time().fromString("16:00", "HH:mm"))
         self.time_out.setEnabled(True)
         self.location_edit.setEnabled(True)
         self.location_edit.setText("Tychy")
@@ -352,8 +342,8 @@ class DayRow(QFrame):
             "date": self.day_date,
             "status": self.status_combo.currentData(),
             "status_label": self.status_combo.currentText(),
-            "time_in": self.time_in.get_time_str(),
-            "time_out": self.time_out.get_time_str(),
+            "time_in": self.time_in.time().toString("HH:mm"),
+            "time_out": self.time_out.time().toString("HH:mm"),
             "location": self.location_edit.text().strip(),
             "is_weekend": self._is_weekend,
             "is_holiday": self._is_holiday,
