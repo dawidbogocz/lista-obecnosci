@@ -123,23 +123,25 @@ class SignatureCanvas(QWidget):
         return self._stroked and not self._path.isEmpty()
 
     def to_data_url(self):
-        """Return signature as a base64 data URL — no temp files, no cropping issues."""
+        """Render signature path on a clean white canvas — no guide lines, no labels."""
         if not self.has_sig():
             return None
-        px = self.grab()
-        if px.isNull():
-            return None
-        ch = self.height() - 35
-        if ch < 10: ch = self.height() - 10
-        c = px.copy(0, 0, px.width(), ch)
-        if c.isNull():
-            return None
-        s = c.scaled(c.width() * 3, c.height() * 3,
-                     Qt.AspectRatioMode.KeepAspectRatio,
-                     Qt.TransformationMode.SmoothTransformation)
+        scale = 3
+        w = self.width() * scale
+        h = self.height() * scale
+        img = QImage(w, h, QImage.Format.Format_RGB32)
+        img.fill(Qt.GlobalColor.white)
+        p = QPainter(img)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.scale(scale, scale)
+        pen = QPen(QColor(0, 0, 140), 2, Qt.PenStyle.SolidLine,
+                   Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.drawPath(self._path)
+        p.end()
         buf = QBuffer()
         buf.open(QIODevice.OpenModeFlag.WriteOnly)
-        s.save(buf, "PNG")
+        img.save(buf, "PNG")
         buf.close()
         b64 = base64.b64encode(buf.data()).decode()
         return f"data:image/png;base64,{b64}"
@@ -432,7 +434,7 @@ class AttendanceApp(QMainWindow):
                 if label:
                     parts.append(f'<div style="font-size:10pt">{label}</div>')
                 if has_sig and sig_url:
-                    parts.append(f'<img src="{sig_url}" style="height:0.7cm; display:block; margin:0 auto">')
+                    parts.append(f'<img src="{sig_url}" style="height:1.1cm; display:block; margin:2px auto">')
                 elif not label and text:
                     parts.append(f'<span style="font-size:10pt">{text}</span>')
                 return "".join(parts) if parts else "&nbsp;"
