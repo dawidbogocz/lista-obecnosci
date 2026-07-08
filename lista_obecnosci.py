@@ -134,21 +134,30 @@ class SignatureCanvas(QWidget):
         return self._stroked and not self._path.isEmpty()
 
     def save_png(self, path: str) -> bool:
+        """Render signature path onto white image with generous padding."""
         if not self.has_sig():
             return False
-        r = self._path.boundingRect().adjusted(-8, -8, 8, 8)
-        if r.isEmpty() or r.width() < 2 or r.height() < 2:
+        pr = self._path.boundingRect()
+        if pr.isEmpty():
             return False
+        # Generous padding to prevent pen-width clipping
+        margin = 30
+        px = int(pr.x()) - margin
+        py = int(pr.y()) - margin
+        pw = int(pr.width()) + margin * 2
+        ph = int(pr.height()) + margin * 2
+        pw = max(pw, 100)
+        ph = max(ph, 50)
         scale = 4
-        iw = max(1, int(r.width() * scale))
-        ih = max(1, int(r.height() * scale))
+        iw = pw * scale
+        ih = ph * scale
         img = QImage(iw, ih, QImage.Format.Format_RGB32)
         img.fill(Qt.GlobalColor.white)
         p = QPainter(img)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.scale(scale, scale)
-        p.translate(-r.x(), -r.y())
-        pen = QPen(QColor(0, 0, 140), 2, Qt.PenStyle.SolidLine,
+        p.translate(-px, -py)
+        pen = QPen(QColor(0, 0, 140), 3, Qt.PenStyle.SolidLine,
                    Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
         p.setPen(pen)
         p.drawPath(self._path)
@@ -407,31 +416,31 @@ class AttendanceApp(QMainWindow):
 
         # Tight margins for single-page fit
         for section in doc.sections:
-            section.top_margin = Cm(1.0)
-            section.bottom_margin = Cm(1.0)
-            section.left_margin = Cm(1.5)
+            section.top_margin = Cm(0.8)
+            section.bottom_margin = Cm(0.6)
+            section.left_margin = Cm(1.2)
             section.right_margin = Cm(1.0)
 
         doc.styles['Normal'].font.name = 'Calibri'
-        doc.styles['Normal'].font.size = Pt(8)
+        doc.styles['Normal'].font.size = Pt(7)
 
         # Title
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p.paragraph_format.space_after = Pt(1)
+        p.paragraph_format.space_after = Pt(0)
         p.paragraph_format.space_before = Pt(0)
         r = p.add_run(f"LISTA OBECNOŚCI - {month:02d}-{year}")
         r.bold = True
-        r.font.size = Pt(13)
+        r.font.size = Pt(11)
         r.font.name = 'Calibri'
 
         # Employee info
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p.paragraph_format.space_after = Pt(2)
+        p.paragraph_format.space_after = Pt(1)
         p.paragraph_format.space_before = Pt(0)
         r = p.add_run(name + (f" - {dept}" if dept else ""))
-        r.font.size = Pt(9)
+        r.font.size = Pt(8)
         r.font.name = 'Calibri'
 
         # 3 columns: Data | Wejście | Wyjście
@@ -463,7 +472,7 @@ class AttendanceApp(QMainWindow):
                 f'</w:tcMar>')
             tc_pr.append(tc_mar)
             r = cell.paragraphs[0].add_run(h)
-            r.bold = True; r.font.size = Pt(8); r.font.name = 'Calibri'
+            r.bold = True; r.font.size = Pt(7); r.font.name = 'Calibri'
             self._shade(cell, "D9D9D9")
 
         # Set fixed row heights for compact layout
@@ -528,19 +537,19 @@ class AttendanceApp(QMainWindow):
                     # Signature in Wejście/Wyjście
                     if st == "home_office":
                         r = par.add_run("Home Office\n")
-                        r.font.size = Pt(7); r.font.name = 'Calibri'
+                        r.font.size = Pt(6.5); r.font.name = 'Calibri'
                     elif st == "delegacja":
                         loc = rd.get("uwaga", "")
                         label = f"Delegacja - {loc}\n" if loc else "Delegacja\n"
                         r = par.add_run(label)
-                        r.font.size = Pt(7); r.font.name = 'Calibri'
+                        r.font.size = Pt(6.5); r.font.name = 'Calibri'
                     r = par.add_run()
-                    r.add_picture(sig_path, width=Cm(1.8), height=Cm(0.55))
+                    r.add_picture(sig_path, width=Cm(2.8), height=Cm(0.8))
                 else:
                     txt = str(cells_data[ci])
                     if txt:
                         r = par.add_run(txt)
-                        r.font.size = Pt(7); r.font.name = 'Calibri'
+                        r.font.size = Pt(6.5); r.font.name = 'Calibri'
 
                 # Background colors
                 if rd["is_holiday"]:
