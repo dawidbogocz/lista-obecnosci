@@ -17,9 +17,8 @@ from PySide6.QtWidgets import (
     QScrollArea, QMessageBox, QFileDialog, QSpinBox,
     QFrame, QSizePolicy
 )
-from PySide6.QtCore import Qt, QBuffer, QIODevice, QSizeF, QMarginsF
-from PySide6.QtGui import QPainter, QPen, QColor, QFont, QImage, QPainterPath, QTextDocument
-from PySide6.QtPrintSupport import QPrinter
+from PySide6.QtCore import Qt, QBuffer, QIODevice
+from PySide6.QtGui import QPainter, QPen, QColor, QFont, QImage, QPainterPath
 
 from docx import Document
 from docx.shared import Pt, Cm
@@ -259,8 +258,8 @@ class AttendanceApp(QMainWindow):
         af = QPushButton("Auto-fill workdays"); af.setMinimumHeight(36)
         af.setStyleSheet("font-size: 13px; font-weight: bold; padding: 6px 16px;")
         af.clicked.connect(self._auto_fill); bl.addWidget(af); bl.addStretch()
-        for txt, handler in [("Zapisz PDF", self._export_pdf), ("Zapisz HTML", self._export_html),
-                              ("Zapisz DOCX", self._export_docx), ("Zapisz Excel", self._export_excel)]:
+        for txt, handler in [("Zapisz HTML", self._export_html),
+                              ("Zapisz DOCX", self._export_docx)]:
             btn = QPushButton(txt); btn.setMinimumHeight(36)
             btn.setStyleSheet("font-size: 13px; font-weight: bold; padding: 6px 14px;")
             btn.clicked.connect(handler); bl.addWidget(btn)
@@ -299,55 +298,20 @@ class AttendanceApp(QMainWindow):
     # ──────────────── Shared HTML generator ────────────────
 
     def _sig_cell_html(self, show_sig, label, sig_url, font_pt, text_only=False):
-        """Generate HTML for a Wejscie/Wyjscie cell. If text_only, just return text."""
+        """Generate HTML for a Wejscie/Wyjscie cell."""
         if text_only or not show_sig or not sig_url:
             return f'<span style="font-size:{font_pt}pt">{label if label else "&nbsp;"}</span>'
-        # Label inline after signature for uniform row height
-        sig_part = f'<img src="{sig_url}" style="height:1.1cm;display:inline-block;vertical-align:middle">'
+        sig_part = f'<img src="{sig_url}" style="height:1.3cm;display:inline-block;vertical-align:middle">'
         label_part = f'<span style="font-size:{font_pt}pt;vertical-align:middle;margin-left:3px">{label}</span>' if label else ""
         return sig_part + label_part
 
     def _sig_cell_docx(self, par, show_sig, label, sig_path):
-        """Fill a DOCX paragraph with signature + inline label. Uniform row height."""
+        """Fill a DOCX paragraph with signature + inline label."""
         if show_sig and sig_path and os.path.exists(sig_path):
-            r = par.add_run(); r.add_picture(sig_path, width=Cm(2.2), height=Cm(0.65))
+            r = par.add_run(); r.add_picture(sig_path, width=Cm(2.4), height=Cm(0.75))
             if label:
                 r = par.add_run(f"  {label}")
-                r.font.size = Pt(11); r.font.name = 'Calibri'
-
-    # ─── PDF export ───
-
-    def _export_pdf(self):
-        month = self.month_spin.value(); year = self.year_spin.value()
-        name = self.name_edit.text().strip() or "Pracownik"; dept = self.dept_edit.text().strip() or ""
-        fp, _ = QFileDialog.getSaveFileName(self, "Zapisz PDF",
-            os.path.expanduser(f"~/lista_obecnosci_{month:02d}-{year}.pdf"), "PDF (*.pdf)")
-        if not fp: return
-        data = self._collect(); sig_url = self.sig.to_data_url()
-        try:
-            self._render_pdf(fp, data, name, dept, month, year, sig_url)
-            QMessageBox.information(self, "Sukces", f"PDF ZAPISANY:\n{fp}")
-        except Exception as e:
-            QMessageBox.critical(self, "Blad", f"PDF: {e}")
-
-    def _render_pdf(self, fp, data, name, dept, month, year, sig_url):
-        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
-        printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
-        printer.setOutputFileName(fp)
-        # Try all possible page size APIs
-        for attr in ['A4', 'PageSizeA4']:
-            try:
-                if hasattr(QPrinter, attr):
-                    printer.setPageSize(getattr(QPrinter, attr))
-                    break
-            except: pass
-        try: printer.setPageMargins(12, 8, 12, 6, QPrinter.Millimeter)
-        except: pass
-
-        doc = QTextDocument()
-        doc.setHtml(self._html_table(data, name, dept, month, year, sig_url, 9))
-        doc.setPageSize(QSizeF(595, 842))
-        doc.print_(printer)
+                r.font.size = Pt(12); r.font.name = 'Calibri'
 
     # ─── HTML export ───
 
@@ -420,22 +384,22 @@ th {{ background:#D9D9D9; font-size:{font_pt}pt; text-align:center; }}
         for section in doc.sections:
             section.top_margin = Cm(0.7); section.bottom_margin = Cm(0.5)
             section.left_margin = Cm(1.2); section.right_margin = Cm(1.0)
-        doc.styles['Normal'].font.name = 'Calibri'; doc.styles['Normal'].font.size = Pt(11)
+        doc.styles['Normal'].font.name = 'Calibri'; doc.styles['Normal'].font.size = Pt(12)
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER; p.paragraph_format.space_after = Pt(0)
         r = p.add_run(f"LISTA OBECNOSCI - {month:02d}-{year}")
-        r.bold = True; r.font.size = Pt(14); r.font.name = 'Calibri'
+        r.bold = True; r.font.size = Pt(16); r.font.name = 'Calibri'
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER; p.paragraph_format.space_after = Pt(2)
         r = p.add_run(name + (f" - {dept}" if dept else ""))
-        r.font.size = Pt(11); r.font.name = 'Calibri'
+        r.font.size = Pt(12); r.font.name = 'Calibri'
         table = doc.add_table(rows=len(data) + 1, cols=3)
         table.alignment = WD_TABLE_ALIGNMENT.CENTER; table.style = 'Table Grid'
         for ci, h in enumerate(["Data", "Wejscie", "Wyjscie"]):
             cell = table.rows[0].cells[ci]; cell.text = ""
             cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
             r = cell.paragraphs[0].add_run(h)
-            r.bold = True; r.font.size = Pt(11); r.font.name = 'Calibri'
+            r.bold = True; r.font.size = Pt(12); r.font.name = 'Calibri'
             self._shade_cell(cell, "D9D9D9")
             self._zero_padding(cell)
         for ri, rd in enumerate(data):
@@ -449,27 +413,11 @@ th {{ background:#D9D9D9; font-size:{font_pt}pt; text-align:center; }}
                 if ci >= 1 and show_sig and sig_path and os.path.exists(sig_path):
                     self._sig_cell_docx(par, show_sig, label, sig_path)
                 else:
-                    r = par.add_run(str(val)); r.font.size = Pt(11); r.font.name = 'Calibri'
+                    r = par.add_run(str(val)); r.font.size = Pt(12); r.font.name = 'Calibri'
                 if rd["is_holiday"]: self._shade_cell(cell, "FCE4D6")
                 elif rd["is_weekend"] and not rd["status"]: self._shade_cell(cell, "DAE8FC")
                 self._zero_padding(cell)
         doc.save(fp)
-
-    # ─── Excel export ───
-
-    def _export_excel(self):
-        month = self.month_spin.value(); year = self.year_spin.value()
-        name = self.name_edit.text().strip() or "Pracownik"; dept = self.dept_edit.text().strip() or ""
-        fp, _ = QFileDialog.getSaveFileName(self, "Zapisz Excel",
-            os.path.expanduser(f"~/lista_obecnosci_{month:02d}-{year}.xls"), "Excel (*.xls)")
-        if not fp: return
-        data = self._collect(); sig_url = self.sig.to_data_url()
-        try:
-            with open(fp, "w", encoding="utf-8") as f:
-                f.write(self._html_table(data, name, dept, month, year, sig_url, 10))
-            QMessageBox.information(self, "Sukces", f"Excel ZAPISANY:\n{fp}")
-        except Exception as e:
-            QMessageBox.critical(self, "Blad", f"Excel: {e}")
 
     def _shade_cell(self, cell, color):
         cell._tc.get_or_add_tcPr().append(
