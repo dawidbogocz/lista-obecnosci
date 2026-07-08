@@ -131,14 +131,26 @@ class SignatureCanvas(QWidget):
         return self._stroked and not self._path.isEmpty()
 
     def _render_png_buf(self):
+        """Render signature path cropped to content with 12px padding — no wasted whitespace."""
         if not self.has_sig():
             return None
-        scale = 3; w = self.width() * scale; h = self.height() * scale
-        img = QImage(w, h, QImage.Format.Format_RGB32)
+        pr = self._path.boundingRect()
+        if pr.isEmpty():
+            return None
+        pad = 12
+        x = int(pr.x()) - pad
+        y = int(pr.y()) - pad
+        w = int(pr.width()) + pad * 2
+        h = int(pr.height()) + pad * 2
+        w = max(w, 50)
+        h = max(h, 20)
+        scale = 3
+        img = QImage(w * scale, h * scale, QImage.Format.Format_RGB32)
         img.fill(Qt.GlobalColor.white)
         p = QPainter(img)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.scale(scale, scale)
+        p.translate(-x, -y)
         p.setPen(QPen(QColor(0, 0, 140), 2, Qt.PenStyle.SolidLine,
                      Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
         p.drawPath(self._path)
