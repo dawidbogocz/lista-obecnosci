@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QLineEdit, QPushButton, QComboBox,
     QTimeEdit, QScrollArea, QMessageBox, QFileDialog, QSpinBox,
-    QFrame, QSizePolicy
+    QFrame, QSizePolicy, QAbstractSpinBox
 )
 from PySide6.QtCore import Qt, QDate, QSize, Signal, QRectF, QPointF
 from PySide6.QtGui import (
@@ -143,19 +143,15 @@ class SignatureCanvas(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        # background
         painter.fillRect(self.rect(), Qt.GlobalColor.white)
-        # dashed guide line
         pen = QPen(QColor(180, 180, 180), 1, Qt.PenStyle.DashLine)
         painter.setPen(pen)
         y = self.height() - 25
         painter.drawLine(10, y, self.width() - 10, y)
-        # label
         painter.setPen(QColor(120, 120, 120))
         font = QFont("Arial", 9)
         painter.setFont(font)
         painter.drawText(12, y - 4, "Podpis:")
-        # signature path
         if not self._path.isEmpty():
             pen2 = QPen(QColor(0, 0, 140), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
             painter.setPen(pen2)
@@ -200,6 +196,45 @@ class SignatureCanvas(QWidget):
     def has_signature(self) -> bool:
         return not self._path.isEmpty()
 
+    def save_to_png(self, filepath: str) -> bool:
+        """Save the signature to a PNG file. Returns True if saved."""
+        if not self.has_signature():
+            return False
+        qimg = self.to_qimage()
+        if qimg.isNull():
+            return False
+        # Scale up for document quality
+        scaled = qimg.scaled(qimg.width() * 3, qimg.height() * 3,
+                             Qt.AspectRatioMode.KeepAspectRatio,
+                             Qt.TransformationMode.SmoothTransformation)
+        # Fill white background (DOCX doesn't handle transparency well in inline images)
+        final = QImage(scaled.size(), QImage.Format.Format_RGB32)
+        final.fill(Qt.GlobalColor.white)
+        p = QPainter(final)
+        p.drawImage(0, 0, scaled)
+        p.end()
+        return final.save(filepath, "PNG")
+
+
+# ─────────────────────────────────────────────
+# Time input widget (no segment-replacement issue)
+# ─────────────────────────────────────────────
+
+class TimeInput(QLineEdit):
+    """QLineEdit with input mask for time entry — type naturally, no segment replacement."""
+
+    def __init__(self, default_time="08:00", parent=None):
+        super().__init__(parent)
+        self.setInputMask("00:00")
+        self.setText(default_time)
+        self.setPlaceholderText("HH:MM")
+        self.setMinimumWidth(70)
+        self.setMaxLength(5)
+
+    def get_time_str(self) -> str:
+        """Return the time as HH:MM string."""
+        return self.text().strip()
+
 
 # ─────────────────────────────────────────────
 # Day row widget
@@ -240,12 +275,8 @@ class DayRow(QFrame):
         self.status_combo.currentIndexChanged.connect(self._on_status_changed)
         layout.addWidget(self.status_combo)
 
-        # Entry time
-        self.time_in = QTimeEdit()
-        self.time_in.setDisplayFormat("HH:mm")
-        self.time_in.setTime(self.time_in.time().fromString("08:00", "HH:mm"))
-        self.time_in.setMinimumWidth(70)
-        self.time_in.setEnabled(True)
+        # Entry time — natural typing, no segment replacement
+        self.time_in = TimeInput("08:00")
         layout.addWidget(self.time_in)
 
         # Separator
@@ -255,11 +286,7 @@ class DayRow(QFrame):
         layout.addWidget(sep)
 
         # Exit time
-        self.time_out = QTimeEdit()
-        self.time_out.setDisplayFormat("HH:mm")
-        self.time_out.setTime(self.time_out.time().fromString("16:00", "HH:mm"))
-        self.time_out.setMinimumWidth(70)
-        self.time_out.setEnabled(True)
+        self.time_out = TimeInput("16:00")
         layout.addWidget(self.time_out)
 
         # Location
@@ -293,7 +320,6 @@ class DayRow(QFrame):
 
     def _style_holiday(self):
         """Apply holiday background coloring but keep the row editable."""
-        # Pre-fill holiday name in location
         if self._holiday_name:
             self.location_edit.setText(self._holiday_name)
         self.setStyleSheet(f"background-color: {HOLIDAY_COLOR.name()}; border-radius: 2px;")
@@ -308,9 +334,9 @@ class DayRow(QFrame):
             if self.status_combo.itemData(i) == "obecny":
                 self.status_combo.setCurrentIndex(i)
                 break
-        self.time_in.setTime(self.time_in.time().fromString("08:00", "HH:mm"))
+        self.time_in.setText("08:00")
         self.time_in.setEnabled(True)
-        self.time_out.setTime(self.time_out.time().fromString("16:00", "HH:mm"))
+        self.time_out.setText("16:00")
         self.time_out.setEnabled(True)
         self.location_edit.setEnabled(True)
         self.location_edit.setText("Tychy")
@@ -326,8 +352,8 @@ class DayRow(QFrame):
             "date": self.day_date,
             "status": self.status_combo.currentData(),
             "status_label": self.status_combo.currentText(),
-            "time_in": self.time_in.time().toString("HH:mm"),
-            "time_out": self.time_out.time().toString("HH:mm"),
+            "time_in": self.time_in.get_time_str(),
+            "time_out": self.time_out.get_time_str(),
             "location": self.location_edit.text().strip(),
             "is_weekend": self._is_weekend,
             "is_holiday": self._is_holiday,
@@ -460,13 +486,11 @@ class AttendanceApp(QMainWindow):
         month = self.month_spin.value()
         year = self.year_spin.value()
 
-        # Remove old rows
         for row in self._day_rows:
             self.table_layout.removeWidget(row)
             row.deleteLater()
         self._day_rows.clear()
 
-        # Get holidays for this year
         holidays = polish_holidays(year)
 
         days_in_month = monthrange(year, month)[1]
@@ -478,11 +502,9 @@ class AttendanceApp(QMainWindow):
             row = DayRow(d, is_hol, h_name)
             self._day_rows.append(row)
 
-            # Apply weekend styling (editable, just colored background)
             if d.weekday() >= 5:
                 row._style_weekend()
 
-            # Insert before the stretch
             self.table_layout.insertWidget(self.table_layout.count() - 1, row)
 
     def _auto_fill_workdays(self):
@@ -518,16 +540,19 @@ class AttendanceApp(QMainWindow):
 
         data = self._collect_data()
 
+        # Render signature to temp PNG
+        sig_img_path = "/tmp/_attendance_sig_temp.png"
+        has_sig = self.sig_canvas.save_to_png(sig_img_path)
+
         try:
-            self._build_docx(filepath, data, name, dept, month, year)
+            self._build_docx(filepath, data, name, dept, month, year, sig_img_path if has_sig else None)
             QMessageBox.information(self, "Sukces", f"DOKUMENT ZAPISANY:\n{filepath}")
         except Exception as e:
             QMessageBox.critical(self, "Błąd", f"Nie udało się zapisać DOCX:\n{e}")
 
-    def _build_docx(self, filepath, data, name, dept, month, year):
+    def _build_docx(self, filepath, data, name, dept, month, year, sig_img_path=None):
         doc = Document()
 
-        # Set default font to support Polish characters
         style = doc.styles['Normal']
         font = style.font
         font.name = 'Calibri'
@@ -612,17 +637,29 @@ class AttendanceApp(QMainWindow):
                         elif r["is_holiday"]:
                             self._set_cell_shading(cell, "FCE4D6")
 
-        # ── Signature at bottom (dashed line, no actual signature image) ──
+        # ── Signature ──
         doc.add_paragraph()
         sig_para = doc.add_paragraph()
-        run = sig_para.add_run("Podpis pracownika: ....................................................")
+        sig_para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        run = sig_para.add_run("Podpis pracownika:")
         run.font.size = Pt(10)
         run.font.name = 'Calibri'
+
+        if sig_img_path and os.path.exists(sig_img_path):
+            # Add the drawn signature image
+            sig_para2 = doc.add_paragraph()
+            sig_para2.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            run = sig_para2.add_run()
+            run.add_picture(sig_img_path, width=Cm(8), height=Cm(2))
+        else:
+            # Dashed placeholder line if no signature drawn
+            run = sig_para.add_run(" ....................................................")
+            run.font.size = Pt(10)
+            run.font.name = 'Calibri'
 
         doc.save(filepath)
 
     def _set_cell_shading(self, cell, hex_color):
-        """Set background color on a table cell."""
         shading_elm = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{hex_color}"/>')
         cell._tc.get_or_add_tcPr().append(shading_elm)
 
