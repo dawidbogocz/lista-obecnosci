@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Attendance Sheet App (Lista Obecności)
-PySide6 GUI — status in Wejście/Wyjście cells, signature in cells for obecny/home_office/delegacja.
+Single-page DOCX output, per-row signatures, L4, delegacja, uwaga for inne.
 """
 
 import sys
@@ -13,17 +13,17 @@ from calendar import monthrange
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QComboBox,
-    QTimeEdit, QScrollArea, QMessageBox, QFileDialog, QSpinBox,
+    QScrollArea, QMessageBox, QFileDialog, QSpinBox,
     QFrame, QSizePolicy
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPainter, QPen, QColor, QFont, QImage, QPainterPath
 
 from docx import Document
-from docx.shared import Pt, Cm
+from docx.shared import Pt, Cm, Mm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
-from docx.oxml.ns import nsdecls
+from docx.oxml.ns import nsdecls, qn
 from docx.oxml import parse_xml
 
 
@@ -71,14 +71,16 @@ STATUS_OPTIONS = [
     ("obecny", "Obecny"),
     ("home_office", "Home Office"),
     ("urlop", "Urlop"),
+    ("l4", "L4"),
     ("wolne_swieto", "Wolne za święto"),
     ("delegacja", "Delegacja"),
     ("nieobecny", "Nieobecny"),
     ("inne", "Inne"),
 ]
 
-WEEKEND_COLOR = QColor(200, 215, 240)
-HOLIDAY_COLOR = QColor(255, 210, 180)
+# More saturated backgrounds for better contrast
+WEEKEND_COLOR = QColor(180, 200, 235)
+HOLIDAY_COLOR = QColor(255, 195, 160)
 
 
 # ─────────────────────────────────────────────
@@ -167,10 +169,10 @@ class DayRow(QFrame):
         self._holiday_name = holiday_name_str
 
         self.setFrameStyle(QFrame.Shape.NoFrame)
-        self.setMinimumHeight(32)
+        self.setMinimumHeight(30)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(4, 1, 4, 1)
+        layout.setContentsMargins(0, 1, 0, 1)
         layout.setSpacing(6)
 
         self.date_label = QLabel(day_date.strftime("%d-%m-%Y"))
@@ -185,28 +187,11 @@ class DayRow(QFrame):
         self.status_combo.currentIndexChanged.connect(self._on_status_changed)
         layout.addWidget(self.status_combo)
 
-        self.time_in = QTimeEdit()
-        self.time_in.setDisplayFormat("HH:mm")
-        self.time_in.setTime(self.time_in.time().fromString("08:00", "HH:mm"))
-        self.time_in.setMinimumWidth(70)
-        layout.addWidget(self.time_in)
-
-        sep = QLabel("\u2192")
-        sep.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sep.setMaximumWidth(20)
-        layout.addWidget(sep)
-
-        self.time_out = QTimeEdit()
-        self.time_out.setDisplayFormat("HH:mm")
-        self.time_out.setTime(self.time_out.time().fromString("16:00", "HH:mm"))
-        self.time_out.setMinimumWidth(70)
-        layout.addWidget(self.time_out)
-
-        self.loc_edit = QLineEdit()
-        self.loc_edit.setPlaceholderText("Miejsce delegacji")
-        self.loc_edit.setMinimumWidth(150)
-        self.loc_edit.setEnabled(False)
-        layout.addWidget(self.loc_edit)
+        self.uwaga_edit = QLineEdit()
+        self.uwaga_edit.setPlaceholderText("Uwaga")
+        self.uwaga_edit.setMinimumWidth(200)
+        self.uwaga_edit.setEnabled(False)
+        layout.addWidget(self.uwaga_edit, stretch=1)
 
         if is_holiday:
             self._apply_holiday()
@@ -217,23 +202,16 @@ class DayRow(QFrame):
 
     def _on_status_changed(self, idx):
         val = self.status_combo.currentData()
-        if val in ("urlop", "wolne_swieto", "nieobecny"):
-            self.time_in.setEnabled(False)
-            self.time_out.setEnabled(False)
-            self.loc_edit.setEnabled(False)
-        elif val == "delegacja":
-            self.time_in.setEnabled(True)
-            self.time_out.setEnabled(True)
-            self.loc_edit.setEnabled(True)
-        elif val == "home_office":
-            self.time_in.setEnabled(True)
-            self.time_out.setEnabled(True)
-            self.loc_edit.setEnabled(False)
-            self.loc_edit.setText("")
+        if val == "delegacja":
+            self.uwaga_edit.setEnabled(True)
+            self.uwaga_edit.setPlaceholderText("Miejsce delegacji")
+        elif val == "inne":
+            self.uwaga_edit.setEnabled(True)
+            self.uwaga_edit.setPlaceholderText("Opis")
         else:
-            self.time_in.setEnabled(True)
-            self.time_out.setEnabled(True)
-            self.loc_edit.setEnabled(False)
+            self.uwaga_edit.setEnabled(False)
+            if not (val == "obecny" and self.uwaga_edit.text() == "Tychy"):
+                self.uwaga_edit.setText("")
 
     def _apply_holiday(self):
         for i in range(self.status_combo.count()):
@@ -241,7 +219,7 @@ class DayRow(QFrame):
                 self.status_combo.setCurrentIndex(i)
                 break
         if self._holiday_name:
-            self.loc_edit.setText(self._holiday_name)
+            self.uwaga_edit.setText(self._holiday_name)
         self.setStyleSheet(f"background-color: {HOLIDAY_COLOR.name()}; border-radius: 2px;")
 
     def _style_weekend(self):
@@ -252,12 +230,8 @@ class DayRow(QFrame):
             if self.status_combo.itemData(i) == "obecny":
                 self.status_combo.setCurrentIndex(i)
                 break
-        self.time_in.setTime(self.time_in.time().fromString("08:00", "HH:mm"))
-        self.time_in.setEnabled(True)
-        self.time_out.setTime(self.time_out.time().fromString("16:00", "HH:mm"))
-        self.time_out.setEnabled(True)
-        self.loc_edit.setEnabled(False)
-        self.loc_edit.setText("")
+        self.uwaga_edit.setEnabled(False)
+        self.uwaga_edit.setText("")
         self.setStyleSheet("")
 
     def is_workday(self) -> bool:
@@ -268,9 +242,7 @@ class DayRow(QFrame):
             "date": self.day_date,
             "status": self.status_combo.currentData(),
             "status_label": self.status_combo.currentText(),
-            "time_in": self.time_in.time().toString("HH:mm"),
-            "time_out": self.time_out.time().toString("HH:mm"),
-            "location": self.loc_edit.text().strip(),
+            "uwaga": self.uwaga_edit.text().strip(),
             "is_weekend": self._is_weekend,
             "is_holiday": self._is_holiday,
             "holiday_name": self._holiday_name,
@@ -284,8 +256,8 @@ class DayRow(QFrame):
 class AttendanceApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Lista Obecno\u015bci")
-        self.setMinimumSize(900, 700)
+        self.setWindowTitle("Lista Obecności")
+        self.setMinimumSize(700, 700)
         self._rows = []
         self._setup_ui()
 
@@ -295,48 +267,53 @@ class AttendanceApp(QMainWindow):
         ml = QVBoxLayout(c)
         ml.setSpacing(8)
 
+        # Top bar
         top = QHBoxLayout()
         self.month_spin = QSpinBox()
         self.month_spin.setRange(1, 12)
         self.month_spin.setValue(date.today().month)
-        self.month_spin.setPrefix("Miesi\u0105c: ")
+        self.month_spin.setPrefix("Miesiąc: ")
         self.month_spin.setMinimumWidth(140)
         self.year_spin = QSpinBox()
         self.year_spin.setRange(2020, 2100)
         self.year_spin.setValue(date.today().year)
         self.year_spin.setPrefix("Rok: ")
         self.year_spin.setMinimumWidth(120)
-        self.refresh_btn = QPushButton("Od\u015bwie\u017c")
+        self.refresh_btn = QPushButton("Odśwież")
         self.refresh_btn.clicked.connect(self._rebuild)
         top.addWidget(self.month_spin)
         top.addWidget(self.year_spin)
         top.addWidget(self.refresh_btn)
         top.addStretch()
-        top.addWidget(QLabel("Imi\u0119 i nazwisko:"))
+        top.addWidget(QLabel("Imię i nazwisko:"))
         self.name_edit = QLineEdit("Dawid Bogocz")
         self.name_edit.setMinimumWidth(140)
         top.addWidget(self.name_edit)
-        top.addWidget(QLabel("Dzia\u0142:"))
-        self.dept_edit = QLineEdit("Dzia\u0142 IT")
+        top.addWidget(QLabel("Dział:"))
+        self.dept_edit = QLineEdit("Dział IT")
         self.dept_edit.setMinimumWidth(120)
         top.addWidget(self.dept_edit)
         ml.addLayout(top)
 
+        # Separator
         s = QFrame()
         s.setFrameShape(QFrame.Shape.HLine)
         s.setFrameShadow(QFrame.Shadow.Sunken)
         ml.addWidget(s)
 
+        # Header row — widths match DayRow widgets exactly
         hdr = QHBoxLayout()
         hdr.setSpacing(6)
-        for t, w in [("Data", 85), ("Status", 150), ("Wej\u015bcie", 70),
-                      ("", 20), ("Wyj\u015bcie", 70), ("Lokacja", 150)]:
+        hdr.setContentsMargins(0, 0, 0, 0)
+        for t, w in [("Data", 85), ("Status", 150), ("Uwaga", 200)]:
             lbl = QLabel(t)
             lbl.setFont(QFont("Arial", 9, QFont.Weight.Bold))
             lbl.setMinimumWidth(w)
             hdr.addWidget(lbl)
+        hdr.addStretch()
         ml.addLayout(hdr)
 
+        # Scroll area
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -348,15 +325,17 @@ class AttendanceApp(QMainWindow):
         self.scroll.setWidget(self.tw)
         ml.addWidget(self.scroll, stretch=1)
 
+        # Signature
         sl = QHBoxLayout()
         sl.addWidget(QLabel("Podpis:"))
         self.sig = SignatureCanvas()
         sl.addWidget(self.sig, stretch=1)
-        cb = QPushButton("Wyczy\u015b\u0107")
+        cb = QPushButton("Wyczyść")
         cb.clicked.connect(self.sig.clear)
         sl.addWidget(cb)
         ml.addLayout(sl)
 
+        # Buttons
         bl = QHBoxLayout()
         af = QPushButton("Auto-fill workdays")
         af.setMinimumHeight(36)
@@ -394,7 +373,7 @@ class AttendanceApp(QMainWindow):
             if r.is_workday():
                 r.set_present()
                 n += 1
-        QMessageBox.information(self, "Auto-fill", f"Wype\u0142niono {n} dni: Obecny")
+        QMessageBox.information(self, "Auto-fill", f"Wypełniono {n} dni: Obecny")
 
     def _collect(self) -> list:
         return [r.get_data() for r in self._rows]
@@ -413,82 +392,110 @@ class AttendanceApp(QMainWindow):
             return
 
         data = self._collect()
-
-        # Save signature to temp PNG
         sig_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
         has_sig = self.sig.save_png(sig_path)
-
-        # Debug popup
-        if has_sig:
-            sz = os.path.getsize(sig_path)
-            QMessageBox.information(self, "DEBUG - Signature",
-                f"OK - saved {sz} bytes\nPath: {sig_path}")
-        else:
-            QMessageBox.warning(self, "DEBUG - Signature",
-                f"FAILED\nhas_sig()={self.sig.has_sig()}\n"
-                f"_stroked={self.sig._stroked}\n"
-                f"_path.isEmpty()={self.sig._path.isEmpty()}\n"
-                f"_path elem count={len(self.sig._path.elementCount()) if hasattr(self.sig._path, 'elementCount') else 'N/A'}")
 
         try:
             self._build_docx(fp, data, name, dept, month, year,
                              sig_path if has_sig else None)
             QMessageBox.information(self, "Sukces", f"DOKUMENT ZAPISANY:\n{fp}")
         except Exception as e:
-            QMessageBox.critical(self, "B\u0142\u0105d", f"Nie uda\u0142o si\u0119 zapisa\u0107 DOCX:\n{e}")
+            QMessageBox.critical(self, "Błąd", f"Nie udało się zapisać DOCX:\n{e}")
 
     def _build_docx(self, fp, data, name, dept, month, year, sig_path=None):
         doc = Document()
 
-        doc.styles['Normal'].font.name = 'Calibri'
-        doc.styles['Normal'].font.size = Pt(10)
+        # Tight margins for single-page fit
+        for section in doc.sections:
+            section.top_margin = Cm(1.0)
+            section.bottom_margin = Cm(1.0)
+            section.left_margin = Cm(1.5)
+            section.right_margin = Cm(1.0)
 
-        mn = ["", "Stycze\u0144", "Luty", "Marzec", "Kwiecie\u0144", "Maj",
-              "Czerwiec", "Lipiec", "Sierpie\u0144", "Wrzesie\u0144",
-              "Pa\u017adziernik", "Listopad", "Grudzie\u0144"]
+        doc.styles['Normal'].font.name = 'Calibri'
+        doc.styles['Normal'].font.size = Pt(8)
+
+        # Title
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        r = p.add_run(f"LISTA OBECNO\u015aCI - {month:02d}-{year}")
+        p.paragraph_format.space_after = Pt(1)
+        p.paragraph_format.space_before = Pt(0)
+        r = p.add_run(f"LISTA OBECNOŚCI - {month:02d}-{year}")
         r.bold = True
-        r.font.size = Pt(16)
+        r.font.size = Pt(13)
         r.font.name = 'Calibri'
 
+        # Employee info
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.paragraph_format.space_after = Pt(2)
+        p.paragraph_format.space_before = Pt(0)
         r = p.add_run(name + (f" - {dept}" if dept else ""))
-        r.font.size = Pt(10)
-        doc.add_paragraph()
+        r.font.size = Pt(9)
+        r.font.name = 'Calibri'
 
-        # 3 columns: Data | Wej\u015bcie | Wyj\u015bcie
-        headers = ["Data", "Wej\u015bcie", "Wyj\u015bcie"]
-        table = doc.add_table(rows=len(data) + 1, cols=3)
+        # 3 columns: Data | Wejście | Wyjście
+        headers = ["Data", "Wejście", "Wyjście"]
+        nrows = len(data) + 1
+        table = doc.add_table(rows=nrows, cols=3)
         table.alignment = WD_TABLE_ALIGNMENT.CENTER
         table.style = 'Table Grid'
+
+        # Reduce cell padding
+        tbl_pr = table._tbl.tblPr
+        tbl_pr.append(parse_xml(
+            f'<w:tblLayout {nsdecls("w")} w:type="fixed"/>'))
 
         for ci, h in enumerate(headers):
             cell = table.rows[0].cells[ci]
             cell.text = ""
             cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+            cell.paragraphs[0].paragraph_format.space_after = Pt(0)
+            cell.paragraphs[0].paragraph_format.space_before = Pt(0)
+            # Set cell margins to 0
+            tc_pr = cell._tc.get_or_add_tcPr()
+            tc_mar = parse_xml(
+                f'<w:tcMar {nsdecls("w")}>'
+                f'<w:top w:w="0" w:type="dxa"/>'
+                f'<w:left w:w="0" w:type="dxa"/>'
+                f'<w:bottom w:w="0" w:type="dxa"/>'
+                f'<w:right w:w="0" w:type="dxa"/>'
+                f'</w:tcMar>')
+            tc_pr.append(tc_mar)
             r = cell.paragraphs[0].add_run(h)
-            r.bold = True; r.font.size = Pt(9); r.font.name = 'Calibri'
+            r.bold = True; r.font.size = Pt(8); r.font.name = 'Calibri'
             self._shade(cell, "D9D9D9")
+
+        # Set fixed row heights for compact layout
+        row_height = Cm(0.75)
 
         for ri, rd in enumerate(data):
             d = rd["date"]
             st = rd["status"]
 
-            # Cell content for Wej\u015bcie/Wyj\u015bcie
+            # Determine cell content
             if st in ("obecny", "home_office", "delegacja"):
-                wej = rd["time_in"]
-                wyj = rd["time_out"]
-            elif st in ("urlop", "wolne_swieto", "nieobecny", "inne", ""):
+                if st == "obecny":
+                    wej = ""
+                    wyj = ""
+                elif st == "home_office":
+                    wej = "Home Office"
+                    wyj = "Home Office"
+                else:
+                    loc = rd.get("uwaga", "")
+                    txt = f"Delegacja - {loc}" if loc else "Delegacja"
+                    wej = txt; wyj = txt
+            elif st in ("urlop", "l4", "wolne_swieto", "nieobecny", "inne", ""):
                 if rd["is_holiday"] and st == "wolne_swieto":
                     hn = rd.get("holiday_name", "")
-                    wej = f"Wolne: {hn}" if hn else "Wolne za \u015bwi\u0119to"
+                    wej = f"Wolne: {hn}" if hn else "Wolne za święto"
                 elif rd["is_weekend"] and not st:
-                    wej = "dzie\u0144 wolny od pracy"
+                    wej = "dzień wolny od pracy"
+                elif st == "inne":
+                    uw = rd.get("uwaga", "")
+                    wej = f"Inne - {uw}" if uw else "Inne"
                 else:
-                    wej = rd["status_label"] if rd["status_label"] else "\u2014"
+                    wej = rd["status_label"] if rd["status_label"] else "—"
                 wyj = wej
             else:
                 wej = rd["status_label"]; wyj = wej
@@ -501,29 +508,45 @@ class AttendanceApp(QMainWindow):
             for ci in range(3):
                 cell = doc_row.cells[ci]
                 cell.text = ""
+                # Set cell margins to 0
+                tc_pr = cell._tc.get_or_add_tcPr()
+                tc_mar = parse_xml(
+                    f'<w:tcMar {nsdecls("w")}>'
+                    f'<w:top w:w="0" w:type="dxa"/>'
+                    f'<w:left w:w="0" w:type="dxa"/>'
+                    f'<w:bottom w:w="0" w:type="dxa"/>'
+                    f'<w:right w:w="0" w:type="dxa"/>'
+                    f'</w:tcMar>')
+                tc_pr.append(tc_mar)
                 par = cell.paragraphs[0]
                 par.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                par.paragraph_format.space_after = Pt(0)
+                par.paragraph_format.space_before = Pt(0)
+                par.paragraph_format.line_spacing = Pt(10)
 
                 if ci >= 1 and show_sig:
-                    # Wej\u015bcie/Wyj\u015bcie: status label + signature
+                    # Signature in Wejście/Wyjście
                     if st == "home_office":
                         r = par.add_run("Home Office\n")
-                        r.font.size = Pt(8); r.font.name = 'Calibri'
+                        r.font.size = Pt(7); r.font.name = 'Calibri'
                     elif st == "delegacja":
-                        loc_txt = rd.get("location", "")
-                        label = f"Delegacja - {loc_txt}\n" if loc_txt else "Delegacja\n"
+                        loc = rd.get("uwaga", "")
+                        label = f"Delegacja - {loc}\n" if loc else "Delegacja\n"
                         r = par.add_run(label)
-                        r.font.size = Pt(8); r.font.name = 'Calibri'
+                        r.font.size = Pt(7); r.font.name = 'Calibri'
                     r = par.add_run()
-                    r.add_picture(sig_path, width=Cm(2.5), height=Cm(0.8))
+                    r.add_picture(sig_path, width=Cm(1.8), height=Cm(0.55))
                 else:
-                    r = par.add_run(str(cells_data[ci]))
-                    r.font.size = Pt(9); r.font.name = 'Calibri'
+                    txt = str(cells_data[ci])
+                    if txt:
+                        r = par.add_run(txt)
+                        r.font.size = Pt(7); r.font.name = 'Calibri'
 
+                # Background colors
                 if rd["is_holiday"]:
                     self._shade(cell, "FCE4D6")
                 elif rd["is_weekend"] and not rd["status"]:
-                    self._shade(cell, "DAE8FC")
+                    self._shade(cell, "B0C4DE")
 
         doc.save(fp)
 
