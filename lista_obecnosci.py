@@ -1,38 +1,34 @@
-#!/home/dzeyd/.hermes/hermes-agent/venv/bin/python3
+#!/usr/bin/env python3
 """
 Attendance Sheet App (Lista Obecności)
-PySide6 GUI desktop app — calendar-based monthly attendance with signature canvas and PDF export.
+PySide6 GUI desktop app — monthly attendance with DOCX export.
 """
 
 import sys
 import os
-import math
+import re
 from datetime import date, timedelta
 from calendar import monthrange, day_name, month_name
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QLineEdit, QPushButton, QComboBox,
-    QTimeEdit, QScrollArea, QMessageBox, QFileDialog, QSpinBox,
-    QFrame, QSizePolicy
+    QScrollArea, QMessageBox, QFileDialog, QSpinBox,
+    QFrame, QSizePolicy, QCheckBox
 )
-from PySide6.QtCore import Qt, QDate, QSize, Signal, QRectF, QPointF
+from PySide6.QtCore import Qt, QDate, QSize, Signal, QRectF, QPointF, QRegularExpression
 from PySide6.QtGui import (
     QPainter, QPen, QColor, QFont, QImage, QPixmap, QAction,
-    QPainterPath, QPageSize, QTransform
+    QPainterPath, QPageSize, QTransform, QRegularExpressionValidator
 )
 
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm, cm
-from reportlab.lib import colors
-from reportlab.platypus import (
-    SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image
-)
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-import reportlab.lib.fonts
+from docx import Document
+from docx.shared import Inches, Pt, Cm, RGBColor, Emu
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.oxml.ns import qn, nsdecls
+from docx.oxml import parse_xml
+
 
 # ─────────────────────────────────────────────
 # Polish holidays
@@ -128,81 +124,8 @@ STATUS_HOLIDAY = "wolne za święto"
 WEEKEND_COLOR = QColor(240, 240, 240)
 HOLIDAY_COLOR = QColor(252, 228, 214)
 
-
-# ─────────────────────────────────────────────
-# Signature canvas widget
-# ─────────────────────────────────────────────
-
-class SignatureCanvas(QWidget):
-    """A simple drawable canvas for a signature."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setMinimumSize(400, 120)
-        self.setMaximumHeight(160)
-        self.setStyleSheet("background-color: white; border: 1px solid #aaa; border-radius: 4px;")
-        self._path = QPainterPath()
-        self._points = []
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        # background
-        painter.fillRect(self.rect(), Qt.GlobalColor.white)
-        # dashed guide line
-        pen = QPen(QColor(180, 180, 180), 1, Qt.PenStyle.DashLine)
-        painter.setPen(pen)
-        y = self.height() - 25
-        painter.drawLine(10, y, self.width() - 10, y)
-        # label
-        painter.setPen(QColor(120, 120, 120))
-        font = QFont("Arial", 9)
-        painter.setFont(font)
-        painter.drawText(12, y - 4, "Podpis:")
-        # signature path
-        if not self._path.isEmpty():
-            pen2 = QPen(QColor(0, 0, 140), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
-            painter.setPen(pen2)
-            painter.drawPath(self._path)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._path = QPainterPath()
-            self._points = [(event.position().x(), event.position().y())]
-            self._path.moveTo(event.position())
-            self.update()
-
-    def mouseMoveEvent(self, event):
-        if event.buttons() & Qt.MouseButton.LeftButton:
-            self._points.append((event.position().x(), event.position().y()))
-            self._path.lineTo(event.position())
-            self.update()
-
-    def clear_signature(self):
-        self._path = QPainterPath()
-        self._points = []
-        self.update()
-
-    def to_qimage(self) -> QImage:
-        """Render the signature to a QImage with transparent background."""
-        if self._path.isEmpty():
-            return QImage()
-        rect = self._path.boundingRect().adjusted(-5, -5, 5, 5).toRect()
-        if rect.width() < 5 or rect.height() < 5:
-            return QImage()
-        img = QImage(rect.size(), QImage.Format.Format_ARGB32_Premultiplied)
-        img.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(img)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.translate(-rect.topLeft())
-        pen = QPen(QColor(0, 0, 140), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
-        painter.setPen(pen)
-        painter.drawPath(self._path)
-        painter.end()
-        return img
-
-    def has_signature(self) -> bool:
-        return not self._path.isEmpty()
+# Time regex validator for HH:MM format
+TIME_REGEX = QRegularExpression("^([01]?[0-9]|2[0-3]):[0-5][0-9]$")
 
 
 # ─────────────────────────────────────────────
@@ -212,10 +135,10 @@ class SignatureCanvas(QWidget):
 class DayRow(QFrame):
     """A single row for one day in the attendance sheet."""
 
-    def __init__(self, day_date: date, is_weekend: bool, is_holiday: bool, holiday_name_str: str = "", parent=None):
+    def __init__(self, day_date: date, is_holiday: bool, holiday_name_str: str = "", parent=None):
         super().__init__(parent)
         self.day_date = day_date
-        self._is_weekend = is_weekend
+        self._is_weekend = day_date.weekday() >= 5
         self._is_holiday = is_holiday
         self._holiday_name = holiday_name_str
 
@@ -244,11 +167,12 @@ class DayRow(QFrame):
         self.status_combo.currentIndexChanged.connect(self._on_status_changed)
         layout.addWidget(self.status_combo)
 
-        # Entry time
-        self.time_in = QTimeEdit()
-        self.time_in.setDisplayFormat("HH:mm")
-        self.time_in.setTime(self.time_in.time().fromString("07:30", "HH:mm"))
+        # Entry time — QLineEdit with input mask for natural typing
+        self.time_in = QLineEdit("08:00")
+        self.time_in.setInputMask("99:99")
+        self.time_in.setPlaceholderText("HH:MM")
         self.time_in.setMinimumWidth(70)
+        self.time_in.setMaxLength(5)
         self.time_in.setEnabled(True)
         layout.addWidget(self.time_in)
 
@@ -259,10 +183,11 @@ class DayRow(QFrame):
         layout.addWidget(sep)
 
         # Exit time
-        self.time_out = QTimeEdit()
-        self.time_out.setDisplayFormat("HH:mm")
-        self.time_out.setTime(self.time_out.time().fromString("15:30", "HH:mm"))
+        self.time_out = QLineEdit("16:00")
+        self.time_out.setInputMask("99:99")
+        self.time_out.setPlaceholderText("HH:MM")
         self.time_out.setMinimumWidth(70)
+        self.time_out.setMaxLength(5)
         self.time_out.setEnabled(True)
         layout.addWidget(self.time_out)
 
@@ -270,12 +195,11 @@ class DayRow(QFrame):
         self.location_edit = QLineEdit()
         self.location_edit.setPlaceholderText("Lokacja")
         self.location_edit.setMinimumWidth(120)
+        self.location_edit.setText("Tychy")
         layout.addWidget(self.location_edit)
 
-        # Auto-fill for weekends/holidays
-        if is_weekend:
-            self._apply_weekend()
-        elif is_holiday:
+        # Apply holiday auto-fill if needed
+        if is_holiday:
             self._apply_holiday()
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -296,16 +220,6 @@ class DayRow(QFrame):
             self.time_out.setEnabled(True)
             self.location_edit.setEnabled(True)
 
-    def _apply_weekend(self):
-        idx = self.status_combo.findData("")
-        self.status_combo.setCurrentIndex(idx)
-        self.status_combo.setEnabled(False)
-        self.time_in.setEnabled(False)
-        self.time_out.setEnabled(False)
-        self.location_edit.setEnabled(False)
-        self.date_label.setStyleSheet("color: #999;")
-        self.setStyleSheet(f"background-color: {WEEKEND_COLOR.name()}; border-radius: 2px;")
-
     def _apply_holiday(self):
         # Set to "wolne za święto" and show holiday name
         for i in range(self.status_combo.count()):
@@ -320,13 +234,33 @@ class DayRow(QFrame):
             self.location_edit.setText(self._holiday_name)
         self.setStyleSheet(f"background-color: {HOLIDAY_COLOR.name()}; border-radius: 2px;")
 
+    def set_present_defaults(self):
+        """Fill this row with default 'present' values."""
+        self.status_combo.setEnabled(True)
+        for i in range(self.status_combo.count()):
+            if self.status_combo.itemData(i) == "obecny":
+                self.status_combo.setCurrentIndex(i)
+                break
+        self.time_in.setText("08:00")
+        self.time_in.setEnabled(True)
+        self.time_out.setText("16:00")
+        self.time_out.setEnabled(True)
+        self.location_edit.setEnabled(True)
+        self.location_edit.setText("Tychy")
+        self.date_label.setStyleSheet("")
+        self.setStyleSheet("")
+
+    def is_workday(self) -> bool:
+        """True if this day is a weekday (not weekend) and not a holiday."""
+        return not self._is_weekend and not self._is_holiday
+
     def get_data(self) -> dict:
         return {
             "date": self.day_date,
             "status": self.status_combo.currentData(),
             "status_label": self.status_combo.currentText(),
-            "time_in": self.time_in.time().toString("HH:mm"),
-            "time_out": self.time_out.time().toString("HH:mm"),
+            "time_in": self.time_in.text().strip(),
+            "time_out": self.time_out.text().strip(),
             "location": self.location_edit.text().strip(),
             "is_weekend": self._is_weekend,
             "is_holiday": self._is_holiday,
@@ -422,24 +356,23 @@ class AttendanceApp(QMainWindow):
 
         main_layout.addWidget(self.scroll, stretch=1)
 
-        # ── Signature ──
-        sig_layout = QHBoxLayout()
-        sig_layout.addWidget(QLabel("Podpis:"))
-        self.sig_canvas = SignatureCanvas()
-        sig_layout.addWidget(self.sig_canvas, stretch=1)
-        clear_sig_btn = QPushButton("Wyczyść")
-        clear_sig_btn.clicked.connect(self.sig_canvas.clear_signature)
-        sig_layout.addWidget(clear_sig_btn)
-        main_layout.addLayout(sig_layout)
-
-        # ── Bottom buttons ──
+        # ── Auto-fill and Export buttons ──
         btn_layout = QHBoxLayout()
-        export_pdf_btn = QPushButton("📄 Zapisz PDF")
-        export_pdf_btn.setMinimumHeight(36)
-        export_pdf_btn.setStyleSheet("font-size: 14px; font-weight: bold; padding: 6px 20px;")
-        export_pdf_btn.clicked.connect(self._export_pdf)
+
+        self.auto_fill_btn = QPushButton("⚡ Auto-fill workdays")
+        self.auto_fill_btn.setMinimumHeight(36)
+        self.auto_fill_btn.setStyleSheet("font-size: 13px; font-weight: bold; padding: 6px 16px;")
+        self.auto_fill_btn.clicked.connect(self._auto_fill_workdays)
+        btn_layout.addWidget(self.auto_fill_btn)
+
         btn_layout.addStretch()
-        btn_layout.addWidget(export_pdf_btn)
+
+        export_docx_btn = QPushButton("📄 Zapisz DOCX")
+        export_docx_btn.setMinimumHeight(36)
+        export_docx_btn.setStyleSheet("font-size: 14px; font-weight: bold; padding: 6px 20px;")
+        export_docx_btn.clicked.connect(self._export_docx)
+        btn_layout.addWidget(export_docx_btn)
+
         main_layout.addLayout(btn_layout)
 
         # Build initial table
@@ -462,97 +395,99 @@ class AttendanceApp(QMainWindow):
         days_in_month = monthrange(year, month)[1]
         for day_num in range(1, days_in_month + 1):
             d = date(year, month, day_num)
-            is_weekend = d.weekday() >= 5
             is_hol = d in holidays
             h_name = holiday_name(d) if is_hol else ""
 
-            row = DayRow(d, is_weekend, is_hol, h_name)
+            row = DayRow(d, is_hol, h_name)
             self._day_rows.append(row)
             # Insert before the stretch
             self.table_layout.insertWidget(self.table_layout.count() - 1, row)
+
+    def _auto_fill_workdays(self):
+        """Fill all workdays with 'Obecny', 8:00-16:00, Tychy."""
+        for row in self._day_rows:
+            if row.is_workday():
+                row.set_present_defaults()
+        QMessageBox.information(self, "Auto-fill", "Dni robocze wypełnione: Obecny, 8:00-16:00, Tychy")
 
     def _collect_data(self) -> list:
         """Collect all day data into a list of dicts."""
         return [row.get_data() for row in self._day_rows]
 
     # ──────────────────────────────────────────
-    # PDF export
+    # DOCX export
     # ──────────────────────────────────────────
 
-    def _export_pdf(self):
+    def _export_docx(self):
         month = self.month_spin.value()
         year = self.year_spin.value()
         name = self.name_edit.text().strip() or "Pracownik"
         dept = self.dept_edit.text().strip() or ""
 
-        default_filename = f"lista_obecnosci_{month:02d}-{year}.pdf"
+        default_filename = f"lista_obecnosci_{month:02d}-{year}.docx"
         filepath, _ = QFileDialog.getSaveFileName(
-            self, "Zapisz PDF", os.path.expanduser(f"~/{default_filename}"),
-            "PDF (*.pdf)"
+            self, "Zapisz DOCX", os.path.expanduser(f"~/{default_filename}"),
+            "Word (*.docx)"
         )
         if not filepath:
             return
 
         data = self._collect_data()
 
-        # Render signature to temp image
-        sig_img_path = None
-        if self.sig_canvas.has_signature():
-            qimg = self.sig_canvas.to_qimage()
-            if not qimg.isNull():
-                sig_img_path = "/tmp/_attendance_sig_temp.png"
-                qimg.save(sig_img_path)
-
         try:
-            self._build_pdf(filepath, data, name, dept, month, year, sig_img_path)
-            QMessageBox.information(self, "Sukces", f"PDF zapisany:\n{filepath}")
+            self._build_docx(filepath, data, name, dept, month, year)
+            QMessageBox.information(self, "Sukces", f"DOKUMENT ZAPISANY:\n{filepath}")
         except Exception as e:
-            QMessageBox.critical(self, "Błąd", f"Nie udało się zapisać PDF:\n{e}")
+            QMessageBox.critical(self, "Błąd", f"Nie udało się zapisać DOCX:\n{e}")
 
-    def _build_pdf(self, filepath, data, name, dept, month, year, sig_img_path=None):
-        doc = SimpleDocTemplate(
-            filepath, pagesize=A4,
-            leftMargin=15 * mm, rightMargin=10 * mm,
-            topMargin=15 * mm, bottomMargin=15 * mm,
-        )
+    def _build_docx(self, filepath, data, name, dept, month, year):
+        doc = Document()
 
-        styles = getSampleStyleSheet()
-        styles.add(ParagraphStyle(
-            name='CenterTitle', parent=styles['Normal'],
-            fontSize=16, alignment=TA_CENTER, spaceAfter=4 * mm,
-            fontName="Helvetica-Bold"
-        ))
-        styles.add(ParagraphStyle(
-            name='InfoLine', parent=styles['Normal'],
-            fontSize=10, alignment=TA_CENTER, spaceAfter=2 * mm,
-        ))
+        # Set default font to support Polish characters
+        style = doc.styles['Normal']
+        font = style.font
+        font.name = 'Calibri'
+        font.size = Pt(10)
 
-        elements = []
-
-        # Title
+        # ── Title ──
         month_names = [
             "", "Styczeń", "Luty", "Marzec", "Kwiecień", "Maj", "Czerwiec",
             "Lipiec", "Sierpień", "Wrzesień", "Październik", "Listopad", "Grudzień"
         ]
-        title = f"LISTA OBECNOŚCI - {month_names[month]} {year}"
-        elements.append(Paragraph(title, styles['CenterTitle']))
+        title = doc.add_paragraph()
+        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = title.add_run(f"LISTA OBECNOŚCI - {month_names[month]} {year}")
+        run.bold = True
+        run.font.size = Pt(16)
+        run.font.name = 'Calibri'
 
-        info_line = f"{name}"
+        # ── Employee info ──
+        info_line = doc.add_paragraph()
+        info_line.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        info_text = name
         if dept:
-            info_line += f" — {dept}"
-        elements.append(Paragraph(info_line, styles['InfoLine']))
-        elements.append(Spacer(1, 4 * mm))
+            info_text += f" — {dept}"
+        run = info_line.add_run(info_text)
+        run.font.size = Pt(10)
+        run.font.name = 'Calibri'
 
-        # Table
-        table_data = [["Data", "Status", "Wejście", "Wyjście", "Lokacja / Uwagi"]]
+        # Spacer
+        doc.add_paragraph()
+
+        # ── Table ──
+        day_names_short = ["Pon", "Wt", "Śr", "Czw", "Pt", "Sob", "Niedz"]
+
+        table_data = []
+        # Header row
+        table_data.append(["Data", "Status", "Wejście", "Wyjście", "Lokacja / Uwagi"])
 
         for row_data in data:
             d = row_data["date"]
-            day_names_short = ["Pon", "Wt", "Śr", "Czw", "Pt", "Sob", "Niedz"]
             date_str = f"{d.day:02d} {day_names_short[d.weekday()]}"
 
             status = row_data["status_label"]
-            if row_data["is_weekend"]:
+            if row_data["is_weekend"] and not row_data["status"]:
+                # Weekend with no status set by user — label it
                 status = "Dzień wolny od pracy"
             elif row_data["is_holiday"] and row_data["status"] == "wolne_swieto":
                 hname = row_data.get("holiday_name", "")
@@ -564,68 +499,55 @@ class AttendanceApp(QMainWindow):
             time_in = row_data["time_in"] if row_data["status"] in ("obecny", "home_office", "inne", "") else "—"
             time_out = row_data["time_out"] if row_data["status"] in ("obecny", "home_office", "inne", "") else "—"
             location = row_data.get("location", "")
-            if row_data["is_weekend"]:
+            if row_data["is_weekend"] and not row_data["status"]:
                 location = "—"
             elif row_data["is_holiday"] and row_data["holiday_name"]:
                 location = row_data["holiday_name"]
 
             table_data.append([date_str, status, time_in, time_out, location])
 
-        # Calculate column widths
-        page_width = A4[0] - 25 * mm
+        # Create table
+        table = doc.add_table(rows=len(table_data), cols=5)
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        table.style = 'Table Grid'
+
+        # Set column widths
+        page_width = Cm(18.5)  # A4 minus margins
         col_widths = [page_width * 0.16, page_width * 0.30, page_width * 0.12, page_width * 0.12, page_width * 0.30]
 
-        tbl = Table(table_data, colWidths=col_widths, repeatRows=1)
+        for row_idx, row_data in enumerate(table_data):
+            row = table.rows[row_idx]
+            for col_idx, cell_text in enumerate(row_data):
+                cell = row.cells[col_idx]
+                cell.text = ""
+                p = cell.paragraphs[0]
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER if col_idx != 4 else WD_ALIGN_PARAGRAPH.LEFT
+                run = p.add_run(str(cell_text))
+                run.font.size = Pt(9)
+                run.font.name = 'Calibri'
 
-        # Style
-        style_cmds = [
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, 0), 9),
-            ('FONTSIZE', (0, 1), (-1, -1), 8),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('ALIGN', (4, 1), (4, -1), 'LEFT'),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-            ('BACKGROUND', (0, 0), (-1, 0), colors.Color(0.85, 0.85, 0.85)),
-            ('TOPPADDING', (0, 0), (-1, -1), 3),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
-        ]
+                if row_idx == 0:
+                    # Header row
+                    run.bold = True
+                    self._set_cell_shading(cell, "D9D9D9")
+                else:
+                    # Data rows - color weekends and holidays
+                    data_idx = row_idx - 1
+                    if data_idx < len(data):
+                        r = data[data_idx]
+                        if r["is_weekend"] and not r["status"]:
+                            self._set_cell_shading(cell, "F2F2F2")
+                        elif r["is_holiday"]:
+                            self._set_cell_shading(cell, "FCE4D6")
 
-        # Color weekends and holidays in table
-        for i, row_data in enumerate(data):
-            row_idx = i + 1  # +1 for header
-            if row_data["is_weekend"]:
-                style_cmds.append(
-                    ('BACKGROUND', (0, row_idx), (-1, row_idx),
-                     colors.Color(0.95, 0.95, 0.95))
-                )
-            elif row_data["is_holiday"]:
-                style_cmds.append(
-                    ('BACKGROUND', (0, row_idx), (-1, row_idx),
-                     colors.Color(0.99, 0.92, 0.88))
-                )
+        # No signature — as requested
 
-        tbl.setStyle(TableStyle(style_cmds))
-        elements.append(tbl)
-        elements.append(Spacer(1, 6 * mm))
+        doc.save(filepath)
 
-        # Signature
-        if sig_img_path and os.path.exists(sig_img_path):
-            sig_elements = []
-            sig_elements.append(Paragraph("Podpis pracownika:", styles['InfoLine']))
-            sig_img = Image(sig_img_path, width=80 * mm, height=20 * mm)
-            sig_elements.append(sig_img)
-            elements.extend(sig_elements)
-        else:
-            sig_line = Table([["Podpis pracownika: ...................................................."]],
-                             colWidths=[page_width])
-            sig_line.setStyle(TableStyle([
-                ('FONTSIZE', (0, 0), (-1, -1), 10),
-                ('TOPPADDING', (0, 0), (-1, -1), 6),
-            ]))
-            elements.append(sig_line)
-
-        doc.build(elements)
+    def _set_cell_shading(self, cell, hex_color):
+        """Set background color on a table cell."""
+        shading_elm = parse_xml(f'<w:shd {nsdecls("w")} w:fill="{hex_color}"/>')
+        cell._tc.get_or_add_tcPr().append(shading_elm)
 
 
 # ─────────────────────────────────────────────
