@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QMessageBox, QFileDialog, QSpinBox,
     QFrame, QSizePolicy
 )
-from PySide6.QtCore import Qt, QBuffer, QIODevice, QSizeF, QTimer
+from PySide6.QtCore import Qt, QBuffer, QIODevice, QSizeF, QTimer, Signal
 from PySide6.QtGui import (
     QPainter, QPen, QColor, QFont, QImage, QPainterPath, QKeySequence, QShortcut,
     QTextDocument
@@ -210,7 +210,7 @@ class SignatureCanvas(QWidget):
 # ─────────────────────────────────────────────
 
 class DayRow(QFrame):
-    changed = Qt.Signal()
+    changed = Signal()
     def __init__(self, day_date, is_holiday, holiday_name_str="", parent=None):
         super().__init__(parent)
         self.day_date = day_date
