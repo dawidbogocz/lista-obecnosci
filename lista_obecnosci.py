@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Attendance Sheet App (Lista Obecności)
-PySide6 GUI desktop app — monthly attendance with signature canvas and DOCX export.
+PySide6 GUI desktop app — monthly attendance with per-row signature and DOCX export.
 """
 
 import sys
@@ -35,7 +35,6 @@ from docx.oxml import parse_xml
 # ─────────────────────────────────────────────
 
 def _easter(year: int) -> date:
-    """Computes Easter Sunday using the Anonymous Gregorian algorithm."""
     a = year % 19
     b = year // 100
     c = year % 100
@@ -54,30 +53,28 @@ def _easter(year: int) -> date:
 
 
 def polish_holidays(year: int) -> set:
-    """Return set of dates that are Polish official non-working days."""
     easter = _easter(year)
     fixed = {
-        date(year, 1, 1),   # Nowy Rok
-        date(year, 1, 6),   # Święto Trzech Króli
-        date(year, 5, 1),   # Święto Pracy
-        date(year, 5, 3),   # Święto Konstytucji 3 Maja
-        date(year, 8, 15),  # Wniebowzięcie NMP
-        date(year, 11, 1),  # Wszystkich Świętych
-        date(year, 11, 11), # Narodowe Święto Niepodległości
-        date(year, 12, 25), # Boże Narodzenie
-        date(year, 12, 26), # Boże Narodzenie (drugi dzień)
+        date(year, 1, 1),
+        date(year, 1, 6),
+        date(year, 5, 1),
+        date(year, 5, 3),
+        date(year, 8, 15),
+        date(year, 11, 1),
+        date(year, 11, 11),
+        date(year, 12, 25),
+        date(year, 12, 26),
     }
     movable = {
-        easter,                                  # Wielkanoc
-        easter + timedelta(days=1),              # Poniedziałek Wielkanocny
-        easter + timedelta(days=49),             # Zielone Świątki (Pentecost)
-        easter + timedelta(days=60),             # Boże Ciało (Corpus Christi)
+        easter,
+        easter + timedelta(days=1),
+        easter + timedelta(days=49),
+        easter + timedelta(days=60),
     }
     return fixed | movable
 
 
 def holiday_name(d: date) -> str:
-    """Return human-readable name of a Polish holiday, or empty string."""
     holidays = {
         (1, 1): "Nowy Rok",
         (6, 1): "Święto Trzech Króli",
@@ -118,11 +115,9 @@ STATUS_OPTIONS = [
     ("inne", "Inne"),
 ]
 
-STATUS_WEEKEND = "dzień wolny"
-STATUS_HOLIDAY = "wolne za święto"
-
-WEEKEND_COLOR = QColor(240, 240, 240)
-HOLIDAY_COLOR = QColor(252, 228, 214)
+# Visible colors for weekend/holiday distinction
+WEEKEND_COLOR = QColor(200, 215, 240)   # light blue — visible
+HOLIDAY_COLOR = QColor(255, 210, 180)   # warm peach — visible
 
 
 # ─────────────────────────────────────────────
@@ -130,92 +125,104 @@ HOLIDAY_COLOR = QColor(252, 228, 214)
 # ─────────────────────────────────────────────
 
 class SignatureCanvas(QWidget):
-    """A simple drawable canvas for a signature."""
+    """A simple drawable canvas for a signature — supports multi-stroke drawing."""
+
+    CANVAS_WIDTH = 400
+    CANVAS_HEIGHT = 120
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(400, 120)
+        self.setMinimumSize(self.CANVAS_WIDTH, self.CANVAS_HEIGHT)
         self.setMaximumHeight(160)
         self.setStyleSheet("background-color: white; border: 1px solid #aaa; border-radius: 4px;")
         self._path = QPainterPath()
-        self._points = []
+        self._has_drawn = False  # True if user actually drew something (not just clicked)
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.fillRect(self.rect(), Qt.GlobalColor.white)
+        # Dashed guide line
         pen = QPen(QColor(180, 180, 180), 1, Qt.PenStyle.DashLine)
         painter.setPen(pen)
         y = self.height() - 25
         painter.drawLine(10, y, self.width() - 10, y)
+        # Label
         painter.setPen(QColor(120, 120, 120))
         font = QFont("Arial", 9)
         painter.setFont(font)
         painter.drawText(12, y - 4, "Podpis:")
+        # Signature strokes
         if not self._path.isEmpty():
-            pen2 = QPen(QColor(0, 0, 140), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+            pen2 = QPen(QColor(0, 0, 140), 2, Qt.PenStyle.SolidLine,
+                        Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
             painter.setPen(pen2)
             painter.drawPath(self._path)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self._points.append((event.position().x(), event.position().y()))
             self._path.moveTo(event.position())
+            self._has_drawn = False
             self.update()
 
     def mouseMoveEvent(self, event):
         if event.buttons() & Qt.MouseButton.LeftButton:
-            self._points.append((event.position().x(), event.position().y()))
             self._path.lineTo(event.position())
+            self._has_drawn = True
             self.update()
 
     def clear_signature(self):
         self._path = QPainterPath()
-        self._points = []
+        self._has_drawn = False
         self.update()
 
-    def to_qimage(self) -> QImage:
-        """Render the signature to a QImage with transparent background."""
-        if self._path.isEmpty():
-            return QImage()
-        rect = self._path.boundingRect().adjusted(-5, -5, 5, 5).toRect()
-        if rect.width() < 5 or rect.height() < 5:
-            return QImage()
-        img = QImage(rect.size(), QImage.Format.Format_ARGB32_Premultiplied)
-        img.fill(Qt.GlobalColor.transparent)
+    def has_signature(self) -> bool:
+        return self._has_drawn and not self._path.isEmpty()
+
+    def render_for_docx(self, filepath: str) -> bool:
+        """
+        Render the signature onto a fixed-size white background PNG for DOCX embedding.
+        Uses a fixed canvas size so bounding rect cropping can't fail.
+        """
+        if not self.has_signature():
+            return False
+
+        # Fixed output size (matching the canvas but higher res)
+        out_w = self.CANVAS_WIDTH * 3
+        out_h = self.CANVAS_HEIGHT * 3
+
+        # Create white background image
+        img = QImage(out_w, out_h, QImage.Format.Format_RGB32)
+        img.fill(Qt.GlobalColor.white)
+
         painter = QPainter(img)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.translate(-rect.topLeft())
-        pen = QPen(QColor(0, 0, 140), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+        # Scale the path to fill the output nicely
+        path_rect = self._path.boundingRect()
+        if path_rect.isEmpty():
+            painter.end()
+            return False
+
+        # Scale factor — map the path into the center of the output image
+        scale_x = (out_w * 0.85) / path_rect.width()
+        scale_y = (out_h * 0.6) / path_rect.height()
+        scale = min(scale_x, scale_y)
+
+        painter.scale(scale, scale)
+        # Center the path
+        center_x = (out_w / scale) / 2 - path_rect.center().x()
+        center_y = (out_h / scale) / 2 - path_rect.center().y()
+        painter.translate(center_x, center_y)
+
+        pen = QPen(QColor(0, 0, 140), max(2, int(2 * (3 / scale))),
+                   Qt.PenStyle.SolidLine,
+                   Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
         painter.setPen(pen)
         painter.drawPath(self._path)
         painter.end()
-        return img
 
-    def has_signature(self) -> bool:
-        return not self._path.isEmpty()
-
-    def save_to_png(self, filepath: str) -> bool:
-        """Save the signature to a PNG file. Returns True if saved."""
-        if not self.has_signature():
-            return False
-        qimg = self.to_qimage()
-        if qimg.isNull():
-            return False
-        # Scale up for document quality
-        scaled = qimg.scaled(qimg.width() * 3, qimg.height() * 3,
-                             Qt.AspectRatioMode.KeepAspectRatio,
-                             Qt.TransformationMode.SmoothTransformation)
-        # Fill white background (DOCX doesn't handle transparency well in inline images)
-        final = QImage(scaled.size(), QImage.Format.Format_RGB32)
-        final.fill(Qt.GlobalColor.white)
-        p = QPainter(final)
-        p.drawImage(0, 0, scaled)
-        p.end()
-        return final.save(filepath, "PNG")
-
-
-# (Time fields use QTimeEdit)
+        ok = img.save(filepath, "PNG")
+        return ok and os.path.exists(filepath)
 
 
 # ─────────────────────────────────────────────
@@ -257,7 +264,7 @@ class DayRow(QFrame):
         self.status_combo.currentIndexChanged.connect(self._on_status_changed)
         layout.addWidget(self.status_combo)
 
-        # Entry time — QTimeEdit
+        # Entry time
         self.time_in = QTimeEdit()
         self.time_in.setDisplayFormat("HH:mm")
         self.time_in.setTime(self.time_in.time().fromString("08:00", "HH:mm"))
@@ -271,7 +278,7 @@ class DayRow(QFrame):
         sep.setMaximumWidth(20)
         layout.addWidget(sep)
 
-        # Exit time — QTimeEdit
+        # Exit time
         self.time_out = QTimeEdit()
         self.time_out.setDisplayFormat("HH:mm")
         self.time_out.setTime(self.time_out.time().fromString("16:00", "HH:mm"))
@@ -286,9 +293,11 @@ class DayRow(QFrame):
         self.location_edit.setText("Tychy")
         layout.addWidget(self.location_edit)
 
-        # Apply coloring for holidays (not locked, just visual)
+        # Apply styling
         if is_holiday:
             self._style_holiday()
+        elif self._is_weekend:
+            self._style_weekend()
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
@@ -309,13 +318,19 @@ class DayRow(QFrame):
             self.location_edit.setEnabled(True)
 
     def _style_holiday(self):
-        """Apply holiday background coloring but keep the row editable."""
+        """Auto-fill holiday but keep row editable."""
+        # Set status to "Wolne za święto" as default, but combo stays enabled
+        for i in range(self.status_combo.count()):
+            if self.status_combo.itemData(i) == "wolne_swieto":
+                self.status_combo.setCurrentIndex(i)
+                break
+        # Fill holiday name in location
         if self._holiday_name:
             self.location_edit.setText(self._holiday_name)
         self.setStyleSheet(f"background-color: {HOLIDAY_COLOR.name()}; border-radius: 2px;")
 
     def _style_weekend(self):
-        """Apply weekend background coloring but keep the row editable."""
+        """Apply weekend background but keep the row editable."""
         self.setStyleSheet(f"background-color: {WEEKEND_COLOR.name()}; border-radius: 2px;")
 
     def set_present_defaults(self):
@@ -334,7 +349,6 @@ class DayRow(QFrame):
         self.setStyleSheet("")
 
     def is_workday(self) -> bool:
-        """True if this day is a weekday (not weekend) and not a holiday."""
         return not self._is_weekend and not self._is_holiday
 
     def get_data(self) -> dict:
@@ -372,7 +386,6 @@ class AttendanceApp(QMainWindow):
         # ── Top bar: month picker + employee info ──
         top_bar = QHBoxLayout()
 
-        # Month/Year
         self.month_spin = QSpinBox()
         self.month_spin.setRange(1, 12)
         self.month_spin.setValue(date.today().month)
@@ -393,7 +406,6 @@ class AttendanceApp(QMainWindow):
         top_bar.addWidget(self.refresh_btn)
         top_bar.addStretch()
 
-        # Employee fields
         top_bar.addWidget(QLabel("Imię i nazwisko:"))
         self.name_edit = QLineEdit("Dawid Bogocz")
         self.name_edit.setMinimumWidth(140)
@@ -441,7 +453,7 @@ class AttendanceApp(QMainWindow):
 
         # ── Signature ──
         sig_layout = QHBoxLayout()
-        sig_layout.addWidget(QLabel("Podpis:"))
+        sig_layout.addWidget(QLabel("Podpis (zostanie dodany do każdego wiersza w dokumencie):"))
         self.sig_canvas = SignatureCanvas()
         sig_layout.addWidget(self.sig_canvas, stretch=1)
         clear_sig_btn = QPushButton("Wyczyść")
@@ -452,7 +464,7 @@ class AttendanceApp(QMainWindow):
         # ── Auto-fill and Export buttons ──
         btn_layout = QHBoxLayout()
 
-        self.auto_fill_btn = QPushButton("⚡ Auto-fill workdays")
+        self.auto_fill_btn = QPushButton("Auto-fill workdays")
         self.auto_fill_btn.setMinimumHeight(36)
         self.auto_fill_btn.setStyleSheet("font-size: 13px; font-weight: bold; padding: 6px 16px;")
         self.auto_fill_btn.clicked.connect(self._auto_fill_workdays)
@@ -460,7 +472,7 @@ class AttendanceApp(QMainWindow):
 
         btn_layout.addStretch()
 
-        export_docx_btn = QPushButton("📄 Zapisz DOCX")
+        export_docx_btn = QPushButton("Zapisz DOCX")
         export_docx_btn.setMinimumHeight(36)
         export_docx_btn.setStyleSheet("font-size: 14px; font-weight: bold; padding: 6px 20px;")
         export_docx_btn.clicked.connect(self._export_docx)
@@ -468,11 +480,9 @@ class AttendanceApp(QMainWindow):
 
         main_layout.addLayout(btn_layout)
 
-        # Build initial table
         self._rebuild_table()
 
     def _rebuild_table(self):
-        """Rebuild day rows for the selected month/year."""
         month = self.month_spin.value()
         year = self.year_spin.value()
 
@@ -491,23 +501,18 @@ class AttendanceApp(QMainWindow):
 
             row = DayRow(d, is_hol, h_name)
             self._day_rows.append(row)
-
-            if d.weekday() >= 5:
-                row._style_weekend()
-
             self.table_layout.insertWidget(self.table_layout.count() - 1, row)
 
     def _auto_fill_workdays(self):
-        """Fill all workdays with 'Obecny', 8:00-16:00, Tychy."""
         filled = 0
         for row in self._day_rows:
             if row.is_workday():
                 row.set_present_defaults()
                 filled += 1
-        QMessageBox.information(self, "Auto-fill", f"Wypełniono {filled} dni roboczych: Obecny, 8:00-16:00, Tychy")
+        QMessageBox.information(self, "Auto-fill",
+                                f"Wypełniono {filled} dni roboczych: Obecny, 8:00-16:00, Tychy")
 
     def _collect_data(self) -> list:
-        """Collect all day data into a list of dicts."""
         return [row.get_data() for row in self._day_rows]
 
     # ──────────────────────────────────────────
@@ -532,10 +537,11 @@ class AttendanceApp(QMainWindow):
 
         # Render signature to temp PNG
         sig_img_path = "/tmp/_attendance_sig_temp.png"
-        has_sig = self.sig_canvas.save_to_png(sig_img_path)
+        has_sig = self.sig_canvas.render_for_docx(sig_img_path)
 
         try:
-            self._build_docx(filepath, data, name, dept, month, year, sig_img_path if has_sig else None)
+            self._build_docx(filepath, data, name, dept, month, year,
+                             sig_img_path if has_sig else None)
             QMessageBox.information(self, "Sukces", f"DOKUMENT ZAPISANY:\n{filepath}")
         except Exception as e:
             QMessageBox.critical(self, "Błąd", f"Nie udało się zapisać DOCX:\n{e}")
@@ -560,13 +566,11 @@ class AttendanceApp(QMainWindow):
         run.font.size = Pt(16)
         run.font.name = 'Calibri'
 
-        # ── Employee info ──
-        info_line = doc.add_paragraph()
-        info_line.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        info_text = name
-        if dept:
-            info_text += f" — {dept}"
-        run = info_line.add_run(info_text)
+        # Employee info
+        info = doc.add_paragraph()
+        info.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        info_text = name + (f" — {dept}" if dept else "")
+        run = info.add_run(info_text)
         run.font.size = Pt(10)
         run.font.name = 'Calibri'
 
@@ -575,10 +579,30 @@ class AttendanceApp(QMainWindow):
         # ── Build table data ──
         day_names_short = ["Pon", "Wt", "Śr", "Czw", "Pt", "Sob", "Niedz"]
 
-        table_data = []
-        table_data.append(["Data", "Status", "Wejście", "Wyjście", "Lokacja / Uwagi"])
+        # 6 columns: Data, Status, Wejście, Wyjście, Lokacja, Podpis
+        table = doc.add_table(rows=len(data) + 1, cols=6)
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        table.style = 'Table Grid'
 
-        for row_data in data:
+        # Header row
+        headers = ["Data", "Status", "Wejście", "Wyjście", "Lokacja / Uwagi", "Podpis"]
+        for col_idx, h in enumerate(headers):
+            cell = table.rows[0].cells[col_idx]
+            cell.text = ""
+            p = cell.paragraphs[0]
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = p.add_run(h)
+            run.bold = True
+            run.font.size = Pt(9)
+            run.font.name = 'Calibri'
+            self._set_cell_shading(cell, "D9D9D9")
+
+        # Set column widths
+        page_width = Cm(18.5)
+        col_widths = [Cm(1.8), Cm(4.5), Cm(1.6), Cm(1.6), Cm(4.5), Cm(4.5)]
+
+        # Data rows
+        for row_idx, row_data in enumerate(data):
             d = row_data["date"]
             date_str = f"{d.day:02d} {day_names_short[d.weekday()]}"
 
@@ -597,55 +621,30 @@ class AttendanceApp(QMainWindow):
             elif row_data["is_holiday"] and row_data["holiday_name"]:
                 location = row_data["holiday_name"]
 
-            table_data.append([date_str, status, time_in, time_out, location])
+            values = [date_str, status, time_in, time_out, location, ""]
 
-        # ── Create table ──
-        table = doc.add_table(rows=len(table_data), cols=5)
-        table.alignment = WD_TABLE_ALIGNMENT.CENTER
-        table.style = 'Table Grid'
-
-        for row_idx, row_data in enumerate(table_data):
-            row = table.rows[row_idx]
-            for col_idx, cell_text in enumerate(row_data):
-                cell = row.cells[col_idx]
+            doc_row = table.rows[row_idx + 1]
+            for col_idx, val in enumerate(values):
+                cell = doc_row.cells[col_idx]
                 cell.text = ""
                 p = cell.paragraphs[0]
                 p.alignment = WD_ALIGN_PARAGRAPH.CENTER if col_idx != 4 else WD_ALIGN_PARAGRAPH.LEFT
-                run = p.add_run(str(cell_text))
-                run.font.size = Pt(9)
-                run.font.name = 'Calibri'
 
-                if row_idx == 0:
-                    run.bold = True
-                    self._set_cell_shading(cell, "D9D9D9")
+                if col_idx == 5 and sig_img_path and os.path.exists(sig_img_path):
+                    # Signature image in the last column
+                    run = p.add_run()
+                    run.add_picture(sig_img_path, width=Cm(4.0), height=Cm(1.0))
                 else:
-                    data_idx = row_idx - 1
-                    if data_idx < len(data):
-                        r = data[data_idx]
-                        if not r["status"] and r["is_weekend"]:
-                            self._set_cell_shading(cell, "F2F2F2")
-                        elif r["is_holiday"]:
-                            self._set_cell_shading(cell, "FCE4D6")
+                    run = p.add_run(str(val))
+                    run.font.size = Pt(8)
+                    run.font.name = 'Calibri'
 
-        # ── Signature ──
-        doc.add_paragraph()
-        sig_para = doc.add_paragraph()
-        sig_para.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        run = sig_para.add_run("Podpis pracownika:")
-        run.font.size = Pt(10)
-        run.font.name = 'Calibri'
-
-        if sig_img_path and os.path.exists(sig_img_path):
-            # Add the drawn signature image
-            sig_para2 = doc.add_paragraph()
-            sig_para2.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            run = sig_para2.add_run()
-            run.add_picture(sig_img_path, width=Cm(8), height=Cm(2))
-        else:
-            # Dashed placeholder line if no signature drawn
-            run = sig_para.add_run(" ....................................................")
-            run.font.size = Pt(10)
-            run.font.name = 'Calibri'
+                # Color weekends and holidays
+                is_weekend = row_data["is_weekend"] and not row_data["status"]
+                if row_data["is_holiday"]:
+                    self._set_cell_shading(cell, "FCE4D6")
+                elif is_weekend:
+                    self._set_cell_shading(cell, "DAE8FC")
 
         doc.save(filepath)
 
