@@ -7,7 +7,6 @@ PySide6 GUI — HTML export with embedded signature, prints to one A4 page.
 import sys
 import os
 import base64
-import io
 from datetime import date, timedelta
 from calendar import monthrange
 
@@ -17,7 +16,7 @@ from PySide6.QtWidgets import (
     QScrollArea, QMessageBox, QFileDialog, QSpinBox,
     QFrame, QSizePolicy
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QBuffer, QIODevice
 from PySide6.QtGui import QPainter, QPen, QColor, QFont, QImage, QPainterPath, QPixmap
 
 
@@ -127,23 +126,22 @@ class SignatureCanvas(QWidget):
         """Return signature as a base64 data URL — no temp files, no cropping issues."""
         if not self.has_sig():
             return None
-        # Grab what's on screen — guaranteed WYSIWYG
         px = self.grab()
         if px.isNull():
             return None
-        # Crop above guide line
         ch = self.height() - 35
         if ch < 10: ch = self.height() - 10
         c = px.copy(0, 0, px.width(), ch)
         if c.isNull():
             return None
-        # Scale up 3x
         s = c.scaled(c.width() * 3, c.height() * 3,
                      Qt.AspectRatioMode.KeepAspectRatio,
                      Qt.TransformationMode.SmoothTransformation)
-        buf = io.BytesIO()
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
         s.save(buf, "PNG")
-        b64 = base64.b64encode(buf.getvalue()).decode()
+        buf.close()
+        b64 = base64.b64encode(buf.data()).decode()
         return f"data:image/png;base64,{b64}"
 
 
