@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 """
 Attendance Sheet App (Lista Obecności)
-PySide6 GUI desktop app — monthly attendance with DOCX export.
+PySide6 GUI desktop app — monthly attendance with signature canvas and DOCX export.
 """
 
 import sys
 import os
-import re
+import math
 from datetime import date, timedelta
 from calendar import monthrange, day_name, month_name
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QLineEdit, QPushButton, QComboBox,
-    QScrollArea, QMessageBox, QFileDialog, QSpinBox,
-    QFrame, QSizePolicy, QCheckBox
+    QTimeEdit, QScrollArea, QMessageBox, QFileDialog, QSpinBox,
+    QFrame, QSizePolicy
 )
-from PySide6.QtCore import Qt, QDate, QSize, Signal, QRectF, QPointF, QRegularExpression
+from PySide6.QtCore import Qt, QDate, QSize, Signal, QRectF, QPointF
 from PySide6.QtGui import (
     QPainter, QPen, QColor, QFont, QImage, QPixmap, QAction,
-    QPainterPath, QPageSize, QTransform, QRegularExpressionValidator
+    QPainterPath, QPageSize, QTransform
 )
 
 from docx import Document
@@ -124,8 +124,81 @@ STATUS_HOLIDAY = "wolne za święto"
 WEEKEND_COLOR = QColor(240, 240, 240)
 HOLIDAY_COLOR = QColor(252, 228, 214)
 
-# Time regex validator for HH:MM format
-TIME_REGEX = QRegularExpression("^([01]?[0-9]|2[0-3]):[0-5][0-9]$")
+
+# ─────────────────────────────────────────────
+# Signature canvas widget
+# ─────────────────────────────────────────────
+
+class SignatureCanvas(QWidget):
+    """A simple drawable canvas for a signature."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(400, 120)
+        self.setMaximumHeight(160)
+        self.setStyleSheet("background-color: white; border: 1px solid #aaa; border-radius: 4px;")
+        self._path = QPainterPath()
+        self._points = []
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # background
+        painter.fillRect(self.rect(), Qt.GlobalColor.white)
+        # dashed guide line
+        pen = QPen(QColor(180, 180, 180), 1, Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        y = self.height() - 25
+        painter.drawLine(10, y, self.width() - 10, y)
+        # label
+        painter.setPen(QColor(120, 120, 120))
+        font = QFont("Arial", 9)
+        painter.setFont(font)
+        painter.drawText(12, y - 4, "Podpis:")
+        # signature path
+        if not self._path.isEmpty():
+            pen2 = QPen(QColor(0, 0, 140), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen2)
+            painter.drawPath(self._path)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._path = QPainterPath()
+            self._points = [(event.position().x(), event.position().y())]
+            self._path.moveTo(event.position())
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            self._points.append((event.position().x(), event.position().y()))
+            self._path.lineTo(event.position())
+            self.update()
+
+    def clear_signature(self):
+        self._path = QPainterPath()
+        self._points = []
+        self.update()
+
+    def to_qimage(self) -> QImage:
+        """Render the signature to a QImage with transparent background."""
+        if self._path.isEmpty():
+            return QImage()
+        rect = self._path.boundingRect().adjusted(-5, -5, 5, 5).toRect()
+        if rect.width() < 5 or rect.height() < 5:
+            return QImage()
+        img = QImage(rect.size(), QImage.Format.Format_ARGB32_Premultiplied)
+        img.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(img)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.translate(-rect.topLeft())
+        pen = QPen(QColor(0, 0, 140), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.drawPath(self._path)
+        painter.end()
+        return img
+
+    def has_signature(self) -> bool:
+        return not self._path.isEmpty()
 
 
 # ─────────────────────────────────────────────
@@ -167,12 +240,11 @@ class DayRow(QFrame):
         self.status_combo.currentIndexChanged.connect(self._on_status_changed)
         layout.addWidget(self.status_combo)
 
-        # Entry time — QLineEdit with input mask for natural typing
-        self.time_in = QLineEdit("08:00")
-        self.time_in.setInputMask("99:99")
-        self.time_in.setPlaceholderText("HH:MM")
+        # Entry time
+        self.time_in = QTimeEdit()
+        self.time_in.setDisplayFormat("HH:mm")
+        self.time_in.setTime(self.time_in.time().fromString("08:00", "HH:mm"))
         self.time_in.setMinimumWidth(70)
-        self.time_in.setMaxLength(5)
         self.time_in.setEnabled(True)
         layout.addWidget(self.time_in)
 
@@ -183,11 +255,10 @@ class DayRow(QFrame):
         layout.addWidget(sep)
 
         # Exit time
-        self.time_out = QLineEdit("16:00")
-        self.time_out.setInputMask("99:99")
-        self.time_out.setPlaceholderText("HH:MM")
+        self.time_out = QTimeEdit()
+        self.time_out.setDisplayFormat("HH:mm")
+        self.time_out.setTime(self.time_out.time().fromString("16:00", "HH:mm"))
         self.time_out.setMinimumWidth(70)
-        self.time_out.setMaxLength(5)
         self.time_out.setEnabled(True)
         layout.addWidget(self.time_out)
 
@@ -198,9 +269,9 @@ class DayRow(QFrame):
         self.location_edit.setText("Tychy")
         layout.addWidget(self.location_edit)
 
-        # Apply holiday auto-fill if needed
+        # Apply coloring for holidays (not locked, just visual)
         if is_holiday:
-            self._apply_holiday()
+            self._style_holiday()
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
@@ -220,30 +291,26 @@ class DayRow(QFrame):
             self.time_out.setEnabled(True)
             self.location_edit.setEnabled(True)
 
-    def _apply_holiday(self):
-        # Set to "wolne za święto" and show holiday name
-        for i in range(self.status_combo.count()):
-            if self.status_combo.itemData(i) == "wolne_swieto":
-                self.status_combo.setCurrentIndex(i)
-                break
-        self.status_combo.setEnabled(False)
-        self.time_in.setEnabled(False)
-        self.time_out.setEnabled(False)
-        self.location_edit.setEnabled(False)
+    def _style_holiday(self):
+        """Apply holiday background coloring but keep the row editable."""
+        # Pre-fill holiday name in location
         if self._holiday_name:
             self.location_edit.setText(self._holiday_name)
         self.setStyleSheet(f"background-color: {HOLIDAY_COLOR.name()}; border-radius: 2px;")
 
+    def _style_weekend(self):
+        """Apply weekend background coloring but keep the row editable."""
+        self.setStyleSheet(f"background-color: {WEEKEND_COLOR.name()}; border-radius: 2px;")
+
     def set_present_defaults(self):
         """Fill this row with default 'present' values."""
-        self.status_combo.setEnabled(True)
         for i in range(self.status_combo.count()):
             if self.status_combo.itemData(i) == "obecny":
                 self.status_combo.setCurrentIndex(i)
                 break
-        self.time_in.setText("08:00")
+        self.time_in.setTime(self.time_in.time().fromString("08:00", "HH:mm"))
         self.time_in.setEnabled(True)
-        self.time_out.setText("16:00")
+        self.time_out.setTime(self.time_out.time().fromString("16:00", "HH:mm"))
         self.time_out.setEnabled(True)
         self.location_edit.setEnabled(True)
         self.location_edit.setText("Tychy")
@@ -259,8 +326,8 @@ class DayRow(QFrame):
             "date": self.day_date,
             "status": self.status_combo.currentData(),
             "status_label": self.status_combo.currentText(),
-            "time_in": self.time_in.text().strip(),
-            "time_out": self.time_out.text().strip(),
+            "time_in": self.time_in.time().toString("HH:mm"),
+            "time_out": self.time_out.time().toString("HH:mm"),
             "location": self.location_edit.text().strip(),
             "is_weekend": self._is_weekend,
             "is_holiday": self._is_holiday,
@@ -356,6 +423,16 @@ class AttendanceApp(QMainWindow):
 
         main_layout.addWidget(self.scroll, stretch=1)
 
+        # ── Signature ──
+        sig_layout = QHBoxLayout()
+        sig_layout.addWidget(QLabel("Podpis:"))
+        self.sig_canvas = SignatureCanvas()
+        sig_layout.addWidget(self.sig_canvas, stretch=1)
+        clear_sig_btn = QPushButton("Wyczyść")
+        clear_sig_btn.clicked.connect(self.sig_canvas.clear_signature)
+        sig_layout.addWidget(clear_sig_btn)
+        main_layout.addLayout(sig_layout)
+
         # ── Auto-fill and Export buttons ──
         btn_layout = QHBoxLayout()
 
@@ -400,15 +477,22 @@ class AttendanceApp(QMainWindow):
 
             row = DayRow(d, is_hol, h_name)
             self._day_rows.append(row)
+
+            # Apply weekend styling (editable, just colored background)
+            if d.weekday() >= 5:
+                row._style_weekend()
+
             # Insert before the stretch
             self.table_layout.insertWidget(self.table_layout.count() - 1, row)
 
     def _auto_fill_workdays(self):
         """Fill all workdays with 'Obecny', 8:00-16:00, Tychy."""
+        filled = 0
         for row in self._day_rows:
             if row.is_workday():
                 row.set_present_defaults()
-        QMessageBox.information(self, "Auto-fill", "Dni robocze wypełnione: Obecny, 8:00-16:00, Tychy")
+                filled += 1
+        QMessageBox.information(self, "Auto-fill", f"Wypełniono {filled} dni roboczych: Obecny, 8:00-16:00, Tychy")
 
     def _collect_data(self) -> list:
         """Collect all day data into a list of dicts."""
@@ -471,14 +555,12 @@ class AttendanceApp(QMainWindow):
         run.font.size = Pt(10)
         run.font.name = 'Calibri'
 
-        # Spacer
         doc.add_paragraph()
 
-        # ── Table ──
+        # ── Build table data ──
         day_names_short = ["Pon", "Wt", "Śr", "Czw", "Pt", "Sob", "Niedz"]
 
         table_data = []
-        # Header row
         table_data.append(["Data", "Status", "Wejście", "Wyjście", "Lokacja / Uwagi"])
 
         for row_data in data:
@@ -486,34 +568,26 @@ class AttendanceApp(QMainWindow):
             date_str = f"{d.day:02d} {day_names_short[d.weekday()]}"
 
             status = row_data["status_label"]
-            if row_data["is_weekend"] and not row_data["status"]:
-                # Weekend with no status set by user — label it
+            if not row_data["status"] and row_data["is_weekend"]:
                 status = "Dzień wolny od pracy"
             elif row_data["is_holiday"] and row_data["status"] == "wolne_swieto":
                 hname = row_data.get("holiday_name", "")
-                if hname:
-                    status = f"Wolne: {hname}"
-                else:
-                    status = "Wolne za święto"
+                status = f"Wolne: {hname}" if hname else "Wolne za święto"
 
             time_in = row_data["time_in"] if row_data["status"] in ("obecny", "home_office", "inne", "") else "—"
             time_out = row_data["time_out"] if row_data["status"] in ("obecny", "home_office", "inne", "") else "—"
             location = row_data.get("location", "")
-            if row_data["is_weekend"] and not row_data["status"]:
+            if not row_data["status"] and row_data["is_weekend"]:
                 location = "—"
             elif row_data["is_holiday"] and row_data["holiday_name"]:
                 location = row_data["holiday_name"]
 
             table_data.append([date_str, status, time_in, time_out, location])
 
-        # Create table
+        # ── Create table ──
         table = doc.add_table(rows=len(table_data), cols=5)
         table.alignment = WD_TABLE_ALIGNMENT.CENTER
         table.style = 'Table Grid'
-
-        # Set column widths
-        page_width = Cm(18.5)  # A4 minus margins
-        col_widths = [page_width * 0.16, page_width * 0.30, page_width * 0.12, page_width * 0.12, page_width * 0.30]
 
         for row_idx, row_data in enumerate(table_data):
             row = table.rows[row_idx]
@@ -527,20 +601,23 @@ class AttendanceApp(QMainWindow):
                 run.font.name = 'Calibri'
 
                 if row_idx == 0:
-                    # Header row
                     run.bold = True
                     self._set_cell_shading(cell, "D9D9D9")
                 else:
-                    # Data rows - color weekends and holidays
                     data_idx = row_idx - 1
                     if data_idx < len(data):
                         r = data[data_idx]
-                        if r["is_weekend"] and not r["status"]:
+                        if not r["status"] and r["is_weekend"]:
                             self._set_cell_shading(cell, "F2F2F2")
                         elif r["is_holiday"]:
                             self._set_cell_shading(cell, "FCE4D6")
 
-        # No signature — as requested
+        # ── Signature at bottom (dashed line, no actual signature image) ──
+        doc.add_paragraph()
+        sig_para = doc.add_paragraph()
+        run = sig_para.add_run("Podpis pracownika: ....................................................")
+        run.font.size = Pt(10)
+        run.font.name = 'Calibri'
 
         doc.save(filepath)
 
