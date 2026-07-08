@@ -6,6 +6,7 @@ PySide6 GUI — PDF export (QPainter, perfect one-page), HTML fallback, DOCX fal
 
 import sys
 import os
+import tempfile
 import base64
 from datetime import date, timedelta
 from calendar import monthrange
@@ -16,10 +17,10 @@ from PySide6.QtWidgets import (
     QScrollArea, QMessageBox, QFileDialog, QSpinBox,
     QFrame, QSizePolicy
 )
-from PySide6.QtCore import Qt, QBuffer, QIODevice, QRectF, QMarginsF
+from PySide6.QtCore import Qt, QBuffer, QIODevice, QRectF, QMarginsF, QSizeF
 from PySide6.QtGui import (
     QPainter, QPen, QColor, QFont, QImage, QPainterPath, QPixmap,
-    QPageSize, QPageLayout, QTextDocument
+    QTextDocument
 )
 from PySide6.QtPrintSupport import QPrinter
 
@@ -138,6 +139,24 @@ class SignatureCanvas(QWidget):
         """Render path on clean white canvas, return data URL."""
         if not self.has_sig():
             return None
+        buf = self._render_png_buf()
+        if buf is None:
+            return None
+        return f"data:image/png;base64,{base64.b64encode(buf.data()).decode()}"
+
+    def save_png(self, filepath):
+        """Render path on clean white canvas, save to PNG file."""
+        buf = self._render_png_buf()
+        if buf is None:
+            return False
+        img = QImage()
+        img.loadFromData(buf.data(), "PNG")
+        return img.save(filepath, "PNG")
+
+    def _render_png_buf(self):
+        """Render the signature path on a white canvas, return QBuffer with PNG data."""
+        if not self.has_sig():
+            return None
         scale = 3
         w = self.width() * scale
         h = self.height() * scale
@@ -154,7 +173,7 @@ class SignatureCanvas(QWidget):
         buf.open(QIODevice.OpenModeFlag.WriteOnly)
         img.save(buf, "PNG")
         buf.close()
-        return f"data:image/png;base64,{base64.b64encode(buf.data()).decode()}"
+        return buf
 
 
 # ─────────────────────────────────────────────
@@ -339,7 +358,8 @@ class AttendanceApp(QMainWindow):
         bl.addStretch()
         for txt, handler in [("Zapisz PDF", self._export_pdf),
                               ("Zapisz HTML", self._export_html),
-                              ("Zapisz DOCX", self._export_docx)]:
+                              ("Zapisz DOCX", self._export_docx),
+                              ("Zapisz Excel", self._export_excel)]:
             btn = QPushButton(txt)
             btn.setMinimumHeight(36)
             btn.setStyleSheet("font-size: 13px; font-weight: bold; padding: 6px 14px;")
@@ -425,12 +445,12 @@ class AttendanceApp(QMainWindow):
             QMessageBox.critical(self, "Blad", f"Nie udalo sie zapisac PDF:\n{e}")
 
     def _render_pdf(self, fp, data, name, dept, month, year, sig_data):
-        """Render table to PDF using QPrinter + QPainter for exact one-page output."""
+        """Render table to PDF using QPrinter + QTextDocument for exact one-page output."""
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
-        printer.setPageSize(QPageSize(QPageSize.PageSizeID.A4))
         printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
         printer.setOutputFileName(fp)
-        printer.setPageMargins(QMarginsF(12, 8, 12, 6), QPageLayout.Unit.Millimeter)
+        printer.setPageSize(QPrinter.PageSize.A4)
+        printer.setPageMargins(QMarginsF(12, 8, 12, 6), QPrinter.Unit.Millimeter)
 
         # Build HTML table so we can use QTextDocument for layout
         mn = ["", "Styczen", "Luty", "Marzec", "Kwiecien", "Maj",
@@ -481,8 +501,8 @@ th {{ background:#D9D9D9; font-size:9pt; text-align:center; }}
 
         doc = QTextDocument()
         doc.setHtml(html)
-        # Set page size to A4 in points (1 point = 1/72 inch)
-        doc.setPageSize(QPageSize(QPageSize.PageSizeID.A4).size(QPageSize.SizeUnit.Point))
+        # Set page size to A4 in points (21cm x 29.7cm = 595pt x 842pt)
+        doc.setPageSize(QSizeF(595, 842))
         doc.print_(printer)
 
     # ─── HTML export ───
@@ -553,7 +573,7 @@ th {{ background:#D9D9D9; font-size:10pt; text-align:center; }}
 <table><tr><th style=width:18%>Data</th><th style=width:41%>Wejscie</th><th style=width:41%>Wyjscie</th></tr>
 {rows}</table></body></html>"""
 
-    # ─── DOCX export (no signature) ───
+    # ─── DOCX export (with signature via temp file) ───
 
     def _export_docx(self):
         month = self.month_spin.value()
@@ -569,14 +589,17 @@ th {{ background:#D9D9D9; font-size:10pt; text-align:center; }}
             return
 
         data = self._collect()
+        sig_path = tempfile.NamedTemporaryFile(suffix='.png', delete=False).name
+        has_sig = self.sig.save_png(sig_path)
 
         try:
-            self._build_docx(fp, data, name, dept, month, year)
+            self._build_docx(fp, data, name, dept, month, year,
+                             sig_path if has_sig else None)
             QMessageBox.information(self, "Sukces", f"DOCX ZAPISANY:\n{fp}")
         except Exception as e:
             QMessageBox.critical(self, "Blad", f"Nie udalo sie zapisac DOCX:\n{e}")
 
-    def _build_docx(self, fp, data, name, dept, month, year):
+    def _build_docx(self, fp, data, name, dept, month, year, sig_path=None):
         doc = Document()
         for section in doc.sections:
             section.top_margin = Cm(0.7)
@@ -599,11 +622,10 @@ th {{ background:#D9D9D9; font-size:10pt; text-align:center; }}
 
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        p.paragraph_format.space_after = Pt(0)
+        p.paragraph_format.space_after = Pt(2)
         r = p.add_run(name + (f" - {dept}" if dept else ""))
         r.font.size = Pt(10); r.font.name = 'Calibri'
 
-        # 3 cols: Data, Wejscie, Wyjscie
         table = doc.add_table(rows=len(data) + 1, cols=3)
         table.alignment = WD_TABLE_ALIGNMENT.CENTER
         table.style = 'Table Grid'
@@ -615,30 +637,104 @@ th {{ background:#D9D9D9; font-size:10pt; text-align:center; }}
             r = cell.paragraphs[0].add_run(h)
             r.bold = True; r.font.size = Pt(9); r.font.name = 'Calibri'
             self._shade_cell(cell, "D9D9D9")
+            # Zero cell padding
+            tc_pr = cell._tc.get_or_add_tcPr()
+            tc_pr.append(parse_xml(
+                f'<w:tcMar {nsdecls("w")}>'
+                f'<w:top w:w="0" w:type="dxa"/>'
+                f'<w:left w:w="0" w:type="dxa"/>'
+                f'<w:bottom w:w="0" w:type="dxa"/>'
+                f'<w:right w:w="0" w:type="dxa"/>'
+                f'</w:tcMar>'))
 
         for ri, rd in enumerate(data):
             wej, wyj, show_sig, label = self._cell_info(rd)
-            # DOCX has no signature — just show the label for sig rows
-            if show_sig and label:
-                cell_text = label
-            elif show_sig and not label:
-                cell_text = "Obecny"
-            else:
-                cell_text = wej
+            date_str = rd["date"].strftime("%d-%m-%Y")
+
             doc_row = table.rows[ri + 1]
-            vals = [rd["date"].strftime("%d-%m-%Y"), cell_text, cell_text if not show_sig else cell_text]
-            for ci in range(3):
+            for ci, val in enumerate([date_str, wej, wyj]):
                 cell = doc_row.cells[ci]
                 cell.text = ""
-                cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
-                r = cell.paragraphs[0].add_run(str(vals[ci]))
-                r.font.size = Pt(9); r.font.name = 'Calibri'
+                par = cell.paragraphs[0]
+                par.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                par.paragraph_format.space_after = Pt(0)
+                par.paragraph_format.space_before = Pt(0)
+
+                if ci >= 1 and show_sig and sig_path and os.path.exists(sig_path):
+                    if label:
+                        r = par.add_run(label + "\n")
+                        r.font.size = Pt(8); r.font.name = 'Calibri'
+                    r = par.add_run()
+                    r.add_picture(sig_path, width=Cm(1.8), height=Cm(0.5))
+                else:
+                    r = par.add_run(str(val))
+                    r.font.size = Pt(9); r.font.name = 'Calibri'
+
                 if rd["is_holiday"]:
                     self._shade_cell(cell, "FCE4D6")
                 elif rd["is_weekend"] and not rd["status"]:
                     self._shade_cell(cell, "DAE8FC")
 
+            # Zero cell padding for data rows
+            for ci in range(3):
+                tc_pr = doc_row.cells[ci]._tc.get_or_add_tcPr()
+                tc_pr.append(parse_xml(
+                    f'<w:tcMar {nsdecls("w")}>'
+                    f'<w:top w:w="0" w:type="dxa"/>'
+                    f'<w:left w:w="0" w:type="dxa"/>'
+                    f'<w:bottom w:w="0" w:type="dxa"/>'
+                    f'<w:right w:w="0" w:type="dxa"/>'
+                    f'</w:tcMar>'))
+
         doc.save(fp)
+
+    # ─── Excel export (HTML table saved as .xls — opens in Excel natively) ───
+
+    def _export_excel(self):
+        month = self.month_spin.value()
+        year = self.year_spin.value()
+        name = self.name_edit.text().strip() or "Pracownik"
+        dept = self.dept_edit.text().strip() or ""
+
+        fp, _ = QFileDialog.getSaveFileName(
+            self, "Zapisz Excel",
+            os.path.expanduser(f"~/lista_obecnosci_{month:02d}-{year}.xls"),
+            "Excel (*.xls)")
+        if not fp:
+            return
+
+        data = self._collect()
+
+        try:
+            mn = ["", "Styczen", "Luty", "Marzec", "Kwiecien", "Maj",
+                  "Czerwiec", "Lipiec", "Sierpien", "Wrzesien",
+                  "Pazdziernik", "Listopad", "Grudzien"]
+            info = name + (f" - {dept}" if dept else "")
+
+            rows = ""
+            for rd in data:
+                wej, wyj, show_sig, label = self._cell_info(rd)
+                if show_sig and label:
+                    wej = label; wyj = label
+                elif show_sig and not label:
+                    wej = "Obecny"; wyj = "Obecny"
+                date_str = rd["date"].strftime("%d-%m-%Y")
+                rows += f"<tr><td>{date_str}</td><td>{wej}</td><td>{wyj}</td></tr>\n"
+
+            html = f"""<html><head><meta charset=utf-8>
+<style>td,th{{border:1px solid #888;padding:3px 6px;font-size:10pt;font-family:Calibri}}
+th{{background:#D9D9D9}} table{{border-collapse:collapse}}</style></head>
+<body>
+<h2>LISTA OBECNOSCI - {month:02d}-{year}</h2>
+<p>{info}</p>
+<table><tr><th>Data</th><th>Wejscie</th><th>Wyjscie</th></tr>
+{rows}</table></body></html>"""
+
+            with open(fp, "w", encoding="utf-8") as f:
+                f.write(html)
+            QMessageBox.information(self, "Sukces", f"Excel ZAPISANY:\n{fp}")
+        except Exception as e:
+            QMessageBox.critical(self, "Blad", f"Nie udalo sie zapisac Excela:\n{e}")
 
     def _shade_cell(self, cell, color):
         cell._tc.get_or_add_tcPr().append(
