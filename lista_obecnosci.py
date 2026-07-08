@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Attendance Sheet App (Lista Obecnosci)
-PySide6 GUI — HTML export with embedded signature, prints to one A4 page.
+PySide6 GUI — PDF export (QPainter, perfect one-page), HTML fallback, DOCX fallback.
 """
 
 import sys
@@ -16,8 +16,19 @@ from PySide6.QtWidgets import (
     QScrollArea, QMessageBox, QFileDialog, QSpinBox,
     QFrame, QSizePolicy
 )
-from PySide6.QtCore import Qt, QBuffer, QIODevice
-from PySide6.QtGui import QPainter, QPen, QColor, QFont, QImage, QPainterPath, QPixmap
+from PySide6.QtCore import Qt, QBuffer, QIODevice, QRectF, QMarginsF
+from PySide6.QtGui import (
+    QPainter, QPen, QColor, QFont, QImage, QPainterPath, QPixmap,
+    QPageSize, QPageLayout, QTextDocument
+)
+from PySide6.QtPrintSupport import QPrinter
+
+from docx import Document
+from docx.shared import Pt, Cm
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.oxml.ns import nsdecls
+from docx.oxml import parse_xml
 
 
 # ─────────────────────────────────────────────
@@ -59,7 +70,7 @@ def holiday_name(d):
 
 
 STATUS_OPTIONS = [
-    ("", "—"),
+    ("", "-"),
     ("obecny", "Obecny"),
     ("home_office", "Home Office"),
     ("urlop", "Urlop"),
@@ -72,6 +83,7 @@ STATUS_OPTIONS = [
 
 WEEKEND_COLOR = QColor(180, 200, 235)
 HOLIDAY_COLOR = QColor(255, 195, 160)
+HEADER_COLOR = QColor(217, 217, 217)
 
 
 # ─────────────────────────────────────────────
@@ -123,7 +135,7 @@ class SignatureCanvas(QWidget):
         return self._stroked and not self._path.isEmpty()
 
     def to_data_url(self):
-        """Render signature path on a clean white canvas — no guide lines, no labels."""
+        """Render path on clean white canvas, return data URL."""
         if not self.has_sig():
             return None
         scale = 3
@@ -134,17 +146,15 @@ class SignatureCanvas(QWidget):
         p = QPainter(img)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.scale(scale, scale)
-        pen = QPen(QColor(0, 0, 140), 2, Qt.PenStyle.SolidLine,
-                   Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
-        p.setPen(pen)
+        p.setPen(QPen(QColor(0, 0, 140), 2, Qt.PenStyle.SolidLine,
+                     Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
         p.drawPath(self._path)
         p.end()
         buf = QBuffer()
         buf.open(QIODevice.OpenModeFlag.WriteOnly)
         img.save(buf, "PNG")
         buf.close()
-        b64 = base64.b64encode(buf.data()).decode()
-        return f"data:image/png;base64,{b64}"
+        return f"data:image/png;base64,{base64.b64encode(buf.data()).decode()}"
 
 
 # ─────────────────────────────────────────────
@@ -327,11 +337,14 @@ class AttendanceApp(QMainWindow):
         af.clicked.connect(self._auto_fill)
         bl.addWidget(af)
         bl.addStretch()
-        ex = QPushButton("Zapisz HTML")
-        ex.setMinimumHeight(36)
-        ex.setStyleSheet("font-size: 14px; font-weight: bold; padding: 6px 20px;")
-        ex.clicked.connect(self._export)
-        bl.addWidget(ex)
+        for txt, handler in [("Zapisz PDF", self._export_pdf),
+                              ("Zapisz HTML", self._export_html),
+                              ("Zapisz DOCX", self._export_docx)]:
+            btn = QPushButton(txt)
+            btn.setMinimumHeight(36)
+            btn.setStyleSheet("font-size: 13px; font-weight: bold; padding: 6px 14px;")
+            btn.clicked.connect(handler)
+            bl.addWidget(btn)
         ml.addLayout(bl)
 
         self._rebuild()
@@ -357,23 +370,23 @@ class AttendanceApp(QMainWindow):
             if r.is_workday():
                 r.set_present()
                 n += 1
-        QMessageBox.information(self, "Auto-fill", f"Wypelniono {n} dni: Obecny")
+        QMessageBox.information(self, "Auto-fill",
+                                f"Wypelniono {n} dni: Obecny")
 
     def _collect(self):
         return [r.get_data() for r in self._rows]
 
-    def _cell_text(self, rd):
-        """Return (wejscie_text, wyjscie_text, show_sig, sig_label) for a row."""
+    def _cell_info(self, rd):
+        """Return (wej, wyj, show_sig, label) for a row's cells."""
         st = rd["status"]
         sl = rd["status_label"]
         if st in ("obecny", "home_office", "delegacja"):
-            wej = ""; wyj = ""
             label = ""
             if st == "home_office": label = "Home Office"
             elif st == "delegacja":
                 loc = rd.get("uwaga", "")
                 label = f"Delegacja - {loc}" if loc else "Delegacja"
-            return (wej, wyj, True, label)
+            return ("", "", True, label)
         else:
             if rd["is_holiday"] and st == "wolne_swieto":
                 hn = rd.get("holiday_name", "")
@@ -384,10 +397,97 @@ class AttendanceApp(QMainWindow):
                 uw = rd.get("uwaga", "")
                 t = f"Inne - {uw}" if uw else "Inne"
             else:
-                t = sl if sl else "—"
+                t = sl if sl else "-"
             return (t, t, False, "")
 
-    def _export(self):
+    # ─── PDF export (QPainter — exact, one page) ───
+
+    def _export_pdf(self):
+        month = self.month_spin.value()
+        year = self.year_spin.value()
+        name = self.name_edit.text().strip() or "Pracownik"
+        dept = self.dept_edit.text().strip() or ""
+
+        fp, _ = QFileDialog.getSaveFileName(
+            self, "Zapisz PDF",
+            os.path.expanduser(f"~/lista_obecnosci_{month:02d}-{year}.pdf"),
+            "PDF (*.pdf)")
+        if not fp:
+            return
+
+        data = self._collect()
+        sig_data = self.sig.to_data_url()
+
+        try:
+            self._render_pdf(fp, data, name, dept, month, year, sig_data)
+            QMessageBox.information(self, "Sukces", f"PDF ZAPISANY:\n{fp}")
+        except Exception as e:
+            QMessageBox.critical(self, "Blad", f"Nie udalo sie zapisac PDF:\n{e}")
+
+    def _render_pdf(self, fp, data, name, dept, month, year, sig_data):
+        """Render table to PDF using QPrinter + QPainter for exact one-page output."""
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer.setPageSize(QPageSize(QPageSize.PageSizeID.A4))
+        printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+        printer.setOutputFileName(fp)
+        printer.setPageMargins(QMarginsF(12, 8, 12, 6), QPageLayout.Unit.Millimeter)
+
+        # Build HTML table so we can use QTextDocument for layout
+        mn = ["", "Styczen", "Luty", "Marzec", "Kwiecien", "Maj",
+              "Czerwiec", "Lipiec", "Sierpien", "Wrzesien",
+              "Pazdziernik", "Listopad", "Grudzien"]
+        info = name + (f" - {dept}" if dept else "")
+
+        rows = ""
+        for rd in data:
+            bg = ""
+            if rd["is_holiday"]:
+                bg = ' bgcolor="#FCE4D6"'
+            elif rd["is_weekend"] and not rd["status"]:
+                bg = ' bgcolor="#B0C4DE"'
+
+            wej, wyj, show_sig, label = self._cell_info(rd)
+            date_str = rd["date"].strftime("%d-%m-%Y")
+
+            def cell_html(text, has_sig, lbl):
+                parts = []
+                if lbl:
+                    parts.append(f'<div style="font-size:9pt;margin-bottom:1px">{lbl}</div>')
+                if has_sig and sig_data:
+                    parts.append(f'<img src="{sig_data}" style="height:1.0cm;display:block;margin:1px auto">')
+                elif not lbl and text:
+                    parts.append(f'<span style="font-size:9pt">{text}</span>')
+                return "".join(parts) if parts else "&nbsp;"
+
+            wj = cell_html(wej, show_sig, label)
+            wy = cell_html(wyj, show_sig, label)
+            rows += f"""<tr{bg}><td align=center style="font-size:9pt">{date_str}</td>
+<td align=center style="font-size:9pt">{wj}</td>
+<td align=center style="font-size:9pt">{wy}</td></tr>\n"""
+
+        html = f"""<!DOCTYPE html><html><head><meta charset=utf-8>
+<style>
+body {{ font-family:Calibri,Arial,sans-serif; font-size:9pt; margin:0; padding:0; }}
+h1 {{ text-align:center; font-size:13pt; margin:0 0 1px 0; }}
+.info {{ text-align:center; font-size:9pt; margin:0 0 3px 0; }}
+table {{ width:100%; border-collapse:collapse; }}
+th, td {{ border:1px solid #888; padding:1px 3px; }}
+th {{ background:#D9D9D9; font-size:9pt; text-align:center; }}
+</style></head><body>
+<h1>LISTA OBECNOSCI - {month:02d}-{year}</h1>
+<div class="info">{info}</div>
+<table><tr><th style=width:18%>Data</th><th style=width:41%>Wejscie</th><th style=width:41%>Wyjscie</th></tr>
+{rows}</table></body></html>"""
+
+        doc = QTextDocument()
+        doc.setHtml(html)
+        # Set page size to A4 in points (1 point = 1/72 inch)
+        doc.setPageSize(QPageSize(QPageSize.PageSizeID.A4).size(QPageSize.SizeUnit.Point))
+        doc.print_(printer)
+
+    # ─── HTML export ───
+
+    def _export_html(self):
         month = self.month_spin.value()
         year = self.year_spin.value()
         name = self.name_edit.text().strip() or "Pracownik"
@@ -396,7 +496,7 @@ class AttendanceApp(QMainWindow):
         fp, _ = QFileDialog.getSaveFileName(
             self, "Zapisz HTML",
             os.path.expanduser(f"~/lista_obecnosci_{month:02d}-{year}.html"),
-            "HTML (*.html *.htm)")
+            "HTML (*.html)")
         if not fp:
             return
 
@@ -415,72 +515,134 @@ class AttendanceApp(QMainWindow):
         mn = ["", "Styczen", "Luty", "Marzec", "Kwiecien", "Maj",
               "Czerwiec", "Lipiec", "Sierpien", "Wrzesien",
               "Pazdziernik", "Listopad", "Grudzien"]
+        info = name + (f" - {dept}" if dept else "")
 
-        rows_html = ""
-        row_n = 1
+        rows = ""
         for rd in data:
             bg = ""
-            if rd["is_holiday"]:
-                bg = ' style="background:#FCE4D6"'
-            elif rd["is_weekend"] and not rd["status"]:
-                bg = ' style="background:#B0C4DE"'
+            if rd["is_holiday"]: bg = ' style="background:#FCE4D6"'
+            elif rd["is_weekend"] and not rd["status"]: bg = ' style="background:#B0C4DE"'
 
-            wej, wyj, show_sig, sig_label = self._cell_text(rd)
+            wej, wyj, show_sig, label = self._cell_info(rd)
             date_str = rd["date"].strftime("%d-%m-%Y")
 
-            # Determine cell content for Wejscie and Wyjscie
-            def make_cell(text, has_sig, label):
+            def cell(text, has_sig, lbl):
                 parts = []
-                if label:
-                    parts.append(f'<div style="font-size:10pt">{label}</div>')
+                if lbl: parts.append(f'<div style="font-size:10pt">{lbl}</div>')
                 if has_sig and sig_url:
-                    parts.append(f'<img src="{sig_url}" style="height:1.1cm; display:block; margin:2px auto">')
-                elif not label and text:
+                    parts.append(f'<img src="{sig_url}" style="height:1.1cm;display:block;margin:2px auto">')
+                elif not lbl and text:
                     parts.append(f'<span style="font-size:10pt">{text}</span>')
                 return "".join(parts) if parts else "&nbsp;"
 
-            wj = make_cell(wej, show_sig, sig_label)
-            wy = make_cell(wyj, show_sig, sig_label)
+            wj = cell(wej, show_sig, label)
+            wy = cell(wyj, show_sig, label)
+            rows += f"<tr{bg}><td align=center style=font-size:10pt>{date_str}</td><td align=center style=font-size:10pt>{wj}</td><td align=center style=font-size:10pt>{wy}</td></tr>\n"
 
-            rows_html += f"""        <tr{bg}>
-            <td style="text-align:center;font-size:10pt;padding:2px 4px">{date_str}</td>
-            <td style="text-align:center;font-size:10pt;padding:2px 4px">{wj}</td>
-            <td style="text-align:center;font-size:10pt;padding:2px 4px">{wy}</td>
-        </tr>
-"""
-            row_n += 1
-
-        info = name + (f" - {dept}" if dept else "")
-
-        return f"""<!DOCTYPE html>
-<html lang="pl">
-<head>
-<meta charset="utf-8">
-<style>
-    @page {{ size: A4; margin: 0.7cm 1cm 0.5cm 1cm; }}
-    @media print {{ body {{ margin: 0; padding: 0; }} }}
-    body {{ font-family: Calibri, Arial, sans-serif; font-size: 10pt; margin: 0.5cm; }}
-    h1 {{ text-align: center; font-size: 14pt; margin: 0 0 2px 0; }}
-    .info {{ text-align: center; font-size: 10pt; margin: 0 0 4px 0; }}
-    table {{ width: 100%; border-collapse: collapse; }}
-    th, td {{ border: 1px solid #888; padding: 2px 4px; }}
-    th {{ background: #D9D9D9; font-size: 10pt; text-align: center; }}
-    td {{ vertical-align: middle; }}
-    tr:nth-child(even) td {{ background: inherit; }}
-</style>
-</head>
-<body>
+        return f"""<!DOCTYPE html><html lang=pl><head><meta charset=utf-8><style>
+@page {{ size:A4; margin:0; }}
+body {{ font-family:Calibri,Arial,sans-serif; font-size:10pt; }}
+h1 {{ text-align:center; font-size:14pt; margin:0 0 2px 0; }}
+.info {{ text-align:center; font-size:10pt; margin:0 0 4px 0; }}
+table {{ width:100%; border-collapse:collapse; }}
+th,td {{ border:1px solid #888; padding:2px 4px; }}
+th {{ background:#D9D9D9; font-size:10pt; text-align:center; }}
+</style></head><body>
 <h1>LISTA OBECNOSCI - {month:02d}-{year}</h1>
 <div class="info">{info}</div>
-<table>
-    <tr>
-        <th style="width:18%">Data</th>
-        <th style="width:41%">Wejscie</th>
-        <th style="width:41%">Wyjscie</th>
-    </tr>
-{rows_html}</table>
-</body>
-</html>"""
+<table><tr><th style=width:18%>Data</th><th style=width:41%>Wejscie</th><th style=width:41%>Wyjscie</th></tr>
+{rows}</table></body></html>"""
+
+    # ─── DOCX export (no signature) ───
+
+    def _export_docx(self):
+        month = self.month_spin.value()
+        year = self.year_spin.value()
+        name = self.name_edit.text().strip() or "Pracownik"
+        dept = self.dept_edit.text().strip() or ""
+
+        fp, _ = QFileDialog.getSaveFileName(
+            self, "Zapisz DOCX",
+            os.path.expanduser(f"~/lista_obecnosci_{month:02d}-{year}.docx"),
+            "Word (*.docx)")
+        if not fp:
+            return
+
+        data = self._collect()
+
+        try:
+            self._build_docx(fp, data, name, dept, month, year)
+            QMessageBox.information(self, "Sukces", f"DOCX ZAPISANY:\n{fp}")
+        except Exception as e:
+            QMessageBox.critical(self, "Blad", f"Nie udalo sie zapisac DOCX:\n{e}")
+
+    def _build_docx(self, fp, data, name, dept, month, year):
+        doc = Document()
+        for section in doc.sections:
+            section.top_margin = Cm(0.7)
+            section.bottom_margin = Cm(0.5)
+            section.left_margin = Cm(1.2)
+            section.right_margin = Cm(1.0)
+
+        doc.styles['Normal'].font.name = 'Calibri'
+        doc.styles['Normal'].font.size = Pt(10)
+
+        mn = ["", "Styczen", "Luty", "Marzec", "Kwiecien", "Maj",
+              "Czerwiec", "Lipiec", "Sierpien", "Wrzesien",
+              "Pazdziernik", "Listopad", "Grudzien"]
+
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.paragraph_format.space_after = Pt(0)
+        r = p.add_run(f"LISTA OBECNOSCI - {month:02d}-{year}")
+        r.bold = True; r.font.size = Pt(12); r.font.name = 'Calibri'
+
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.paragraph_format.space_after = Pt(0)
+        r = p.add_run(name + (f" - {dept}" if dept else ""))
+        r.font.size = Pt(10); r.font.name = 'Calibri'
+
+        # 3 cols: Data, Wejscie, Wyjscie
+        table = doc.add_table(rows=len(data) + 1, cols=3)
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        table.style = 'Table Grid'
+
+        for ci, h in enumerate(["Data", "Wejscie", "Wyjscie"]):
+            cell = table.rows[0].cells[ci]
+            cell.text = ""
+            cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+            r = cell.paragraphs[0].add_run(h)
+            r.bold = True; r.font.size = Pt(9); r.font.name = 'Calibri'
+            self._shade_cell(cell, "D9D9D9")
+
+        for ri, rd in enumerate(data):
+            wej, wyj, show_sig, label = self._cell_info(rd)
+            # DOCX has no signature — just show the label for sig rows
+            if show_sig and label:
+                cell_text = label
+            elif show_sig and not label:
+                cell_text = "Obecny"
+            else:
+                cell_text = wej
+            doc_row = table.rows[ri + 1]
+            vals = [rd["date"].strftime("%d-%m-%Y"), cell_text, cell_text if not show_sig else cell_text]
+            for ci in range(3):
+                cell = doc_row.cells[ci]
+                cell.text = ""
+                cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                r = cell.paragraphs[0].add_run(str(vals[ci]))
+                r.font.size = Pt(9); r.font.name = 'Calibri'
+                if rd["is_holiday"]:
+                    self._shade_cell(cell, "FCE4D6")
+                elif rd["is_weekend"] and not rd["status"]:
+                    self._shade_cell(cell, "DAE8FC")
+
+        doc.save(fp)
+
+    def _shade_cell(self, cell, color):
+        cell._tc.get_or_add_tcPr().append(
+            parse_xml(f'<w:shd {nsdecls("w")} w:fill="{color}"/>'))
 
 
 # ─────────────────────────────────────────────
